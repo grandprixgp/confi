@@ -1,1 +1,1 @@
-package configgle
+package confi

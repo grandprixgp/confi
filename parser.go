@@ -1,4 +1,4 @@
-package configgle
+package confi
 
 import (
 	"strings"
