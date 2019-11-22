@@ -3,13 +3,13 @@
 ##### Quick and dirty CLI argument and config file parser. Pass it a `struct` of arguments, your app name, and the desired prefix.
 
 ## Syntax Example
-```
+```bash
 app --hostname=nic.ac --port= 80 --port 8080 --interfaces eth0 vmbr0 \
 --filters="eth0: src host 1.1.1.1" "eth0: dst host 1.1.1.1" --filters "vmbr0: host dst 10.0.0"
 ```
 
 ## Quick Example
-```
+```go
 package main
 
 import (
@@ -35,7 +35,7 @@ func main() {
 		cfg.Hostname, cfg.Port, cfg.Interfaces, cfg.Filters)
 }
 ```
-```
+```bash
 greg@twotone:~/$ app --hostname=nic.ac --port= 80 --port 8080 --interfaces eth0 vmbr0 \
 --filters="eth0: src host 1.1.1.1" "eth0: dst host 1.1.1.1" --filters "vmbr0: host dst 10.0.0"
 nic.ac listening on ports [80 8080]
