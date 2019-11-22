@@ -1,71 +1,387 @@
 package confi
 
 import (
+	"fmt"
+	"reflect"
 	"strings"
+	"unicode"
 )
 
-// parse takes the raw os.Args and splits them up into
-// a slice of CoreRawArguments for future processing
-func parse(settings CoreSettings) []CoreRawArgument {
+type parsedFlag struct {
+	meta   *fieldMeta
+	name   string
+	values []string
+}
 
-	rawArguments := make(map[string]*CoreRawArgument)
+type cliParseResult struct {
+	flags          []parsedFlag
+	positional     []string
+	configFilePath string
+	helpRequested  bool
+}
 
-	var previousArgumentName string
+func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult, error) {
+	res := &cliParseResult{}
+	prefix := p.prefix
+	shortPrefix := p.shortPrefix
 
-	for _, argument := range settings.arguments {
-		if strings.HasPrefix(argument, settings.prefix) {
-			rawArgument := new(CoreRawArgument)
-			
-			argumentWithoutPrefix := argument[len(settings.prefix):]
-			var values []string
-			var length int
-			if strings.Contains(argumentWithoutPrefix, "=") {
-				values = strings.Split(argumentWithoutPrefix, "=")
-				length = len(values)
-			} else {
-				values = strings.Fields(argumentWithoutPrefix)
-				length = len(values)
+	var currentFlag *parsedFlag
+	expectingValue := false
+
+	flushCurrent := func() {
+		if currentFlag != nil {
+			res.flags = append(res.flags, *currentFlag)
+			currentFlag = nil
+			expectingValue = false
+		}
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// End-of-flags delimiter "--"
+		if arg == "--" {
+			flushCurrent()
+			if i+1 < len(args) {
+				res.positional = append(res.positional, args[i+1:]...)
 			}
-			switch true {
-			case length == 0:
-				continue
-			case length == 1:
-				argumentWithValue := values[0]
-				if strings.Contains(values[0], "=") {
-					rawArgument.name, rawArgument.values = strings.Split(argumentWithValue, "=")[0], strings.Split(argumentWithValue, "=")[1:]
+			break
+		}
+
+		// If current flag is expecting a value (or is a multi-value flag) and arg looks like a negative number (e.g. "-5"),
+		// treat it as a value rather than a flag.
+		if currentFlag != nil && (expectingValue || isMultiValueField(currentFlag.meta)) && looksLikeNegativeNumber(arg) {
+			currentFlag.values = append(currentFlag.values, arg)
+			if !isMultiValueField(currentFlag.meta) {
+				flushCurrent()
+			} else {
+				expectingValue = false
+			}
+			continue
+		}
+
+		// Check long prefix (default "--")
+		if prefix != "" && strings.HasPrefix(arg, prefix) && len(arg) > len(prefix) {
+			flushCurrent()
+			withoutPrefix := arg[len(prefix):]
+
+			var rawName, inlineVal string
+			hasInlineVal := false
+			if eqIdx := strings.IndexByte(withoutPrefix, '='); eqIdx >= 0 {
+				rawName = strings.TrimSpace(withoutPrefix[:eqIdx])
+				inlineVal = withoutPrefix[eqIdx+1:]
+				hasInlineVal = true
+			} else {
+				// Support whitespace inside single token if any
+				fields := strings.Fields(withoutPrefix)
+				if len(fields) == 0 {
+					continue
+				}
+				rawName = fields[0]
+				if len(fields) > 1 {
+					inlineVal = strings.Join(fields[1:], " ")
+					hasInlineVal = true
+				}
+			}
+
+			lowerName := strings.ToLower(rawName)
+
+			// Check help flag
+			if p.helpEnabled && (lowerName == "help" || lowerName == "h") {
+				if _, exists := schema.byFlag[lowerName]; !exists {
+					res.helpRequested = true
+					return res, nil
+				}
+			}
+
+			// Check dynamic config flag (e.g., --config path.yaml)
+			if p.configFlag != "" && strings.EqualFold(rawName, p.configFlag) {
+				if hasInlineVal && inlineVal != "" {
+					res.configFilePath = inlineVal
+				} else if i+1 < len(args) {
+					i++
+					res.configFilePath = args[i]
 				} else {
-					rawArgument.name = values[0]
+					return nil, &ParseError{Field: rawName, Message: fmt.Sprintf("flag %s%s requires a file path", prefix, rawName)}
 				}
-			case length > 1:
-				rawArgument.name, rawArgument.values = values[0], values[1:]
+				continue
 			}
 
-			previousArgumentName = rawArgument.name
-			if _, alreadyExists := rawArguments[rawArgument.name]; alreadyExists {
-				for _, value := range rawArgument.values {
-					rawArguments[rawArgument.name].values = append(rawArguments[rawArgument.name].values, value)
+			meta, exists := schema.byFlag[lowerName]
+			negatedBool := false
+			if !exists && strings.HasPrefix(lowerName, "no-") {
+				if candidate, ok := schema.byFlag[strings.TrimPrefix(lowerName, "no-")]; ok && candidate.isBoolean() {
+					meta = candidate
+					exists = true
+					negatedBool = true
+				}
+			}
+
+			if !exists {
+				if p.strict {
+					return nil, &ParseError{Field: rawName, Message: fmt.Sprintf("unknown flag %s%s", prefix, rawName)}
+				}
+				// In non-strict mode, consume inline or subsequent non-flag values blindly
+				currentFlag = &parsedFlag{name: rawName}
+				if hasInlineVal && inlineVal != "" {
+					currentFlag.values = append(currentFlag.values, inlineVal)
+				} else {
+					expectingValue = true
+				}
+				continue
+			}
+
+			if negatedBool {
+				val := "false"
+				if hasInlineVal && inlineVal != "" {
+					if b, err := parseBoolFlexible(inlineVal); err == nil {
+						if b {
+							val = "false"
+						} else {
+							val = "true"
+						}
+					}
+				}
+				res.flags = append(res.flags, parsedFlag{
+					meta:   meta,
+					name:   rawName,
+					values: []string{val},
+				})
+				continue
+			}
+
+			if meta.isBoolean() {
+				if hasInlineVal {
+					val := inlineVal
+					if val == "" {
+						val = "true"
+					}
+					res.flags = append(res.flags, parsedFlag{
+						meta:   meta,
+						name:   rawName,
+						values: []string{val},
+					})
+					continue
+				}
+				// Check if next token is an explicit boolean literal
+				if i+1 < len(args) && isExplicitBoolLiteral(args[i+1]) {
+					i++
+					res.flags = append(res.flags, parsedFlag{
+						meta:   meta,
+						name:   rawName,
+						values: []string{args[i]},
+					})
+					continue
+				}
+				res.flags = append(res.flags, parsedFlag{
+					meta:   meta,
+					name:   rawName,
+					values: []string{"true"},
+				})
+				continue
+			}
+
+			// Non-boolean long flag
+			currentFlag = &parsedFlag{
+				meta: meta,
+				name: rawName,
+			}
+			if hasInlineVal {
+				if inlineVal != "" {
+					currentFlag.values = append(currentFlag.values, inlineVal)
+					if !isMultiValueField(meta) {
+						flushCurrent()
+					}
+				} else {
+					// e.g. "--port= 80" where inlineVal is empty and next token has the value
+					expectingValue = true
 				}
 			} else {
-				rawArguments[rawArgument.name] = rawArgument
+				expectingValue = true
+			}
+			continue
+		}
+
+		// Check short prefix (default "-")
+		if shortPrefix != "" && strings.HasPrefix(arg, shortPrefix) && len(arg) > len(shortPrefix) && (prefix == "" || !strings.HasPrefix(arg, prefix)) {
+			flushCurrent()
+			withoutShort := arg[len(shortPrefix):]
+
+			var rawShort, inlineVal string
+			hasInlineVal := false
+			if eqIdx := strings.IndexByte(withoutShort, '='); eqIdx >= 0 {
+				rawShort = withoutShort[:eqIdx]
+				inlineVal = withoutShort[eqIdx+1:]
+				hasInlineVal = true
+			} else {
+				rawShort = withoutShort
+			}
+
+			if p.helpEnabled && rawShort == "h" {
+				if _, exists := schema.byShort["h"]; !exists {
+					res.helpRequested = true
+					return res, nil
+				}
+			}
+
+			if meta, exists := schema.byShort[rawShort]; exists {
+				if meta.isBoolean() {
+					val := "true"
+					if hasInlineVal && inlineVal != "" {
+						val = inlineVal
+					} else if i+1 < len(args) && isExplicitBoolLiteral(args[i+1]) {
+						i++
+						val = args[i]
+					}
+					res.flags = append(res.flags, parsedFlag{
+						meta:   meta,
+						name:   rawShort,
+						values: []string{val},
+					})
+					continue
+				}
+				currentFlag = &parsedFlag{
+					meta: meta,
+					name: rawShort,
+				}
+				if hasInlineVal {
+					if inlineVal != "" {
+						currentFlag.values = append(currentFlag.values, inlineVal)
+						if !isMultiValueField(meta) {
+							flushCurrent()
+						}
+					} else {
+						expectingValue = true
+					}
+				} else {
+					expectingValue = true
+				}
+				continue
+			}
+
+			// Check bundled single-character short flags, e.g. "-abc"
+			if len(rawShort) > 1 && isBundledShorts(rawShort, schema) {
+				for idx := 0; idx < len(rawShort); idx++ {
+					ch := string(rawShort[idx])
+					meta := schema.byShort[ch]
+					if meta.isBoolean() {
+						val := "true"
+						if idx == len(rawShort)-1 && hasInlineVal && inlineVal != "" {
+							val = inlineVal
+						}
+						res.flags = append(res.flags, parsedFlag{
+							meta:   meta,
+							name:   ch,
+							values: []string{val},
+						})
+					} else {
+						// Last bundled short flag can take the remaining inline value or next argument
+						currentFlag = &parsedFlag{
+							meta: meta,
+							name: ch,
+						}
+						if hasInlineVal && inlineVal != "" {
+							currentFlag.values = append(currentFlag.values, inlineVal)
+							if !isMultiValueField(meta) {
+								flushCurrent()
+							}
+						} else {
+							expectingValue = true
+						}
+					}
+				}
+				continue
+			}
+
+			if p.strict {
+				return nil, &ParseError{Field: rawShort, Message: fmt.Sprintf("unknown short flag %s%s", shortPrefix, rawShort)}
+			}
+			currentFlag = &parsedFlag{name: rawShort}
+			if hasInlineVal && inlineVal != "" {
+				currentFlag.values = append(currentFlag.values, inlineVal)
+			} else {
+				expectingValue = true
+			}
+			continue
+		}
+
+		// Non-flag token
+		if currentFlag != nil {
+			currentFlag.values = append(currentFlag.values, arg)
+			expectingValue = false
+			if currentFlag.meta != nil && !isMultiValueField(currentFlag.meta) {
+				// If it's a scalar string without positional fields defined, allow multi-word strings if user passes them,
+				// unless positional fields exist in the schema.
+				if isStringField(currentFlag.meta) && len(schema.positionalFields) == 0 {
+					continue
+				}
+				flushCurrent()
 			}
 		} else {
-			if len(previousArgumentName) > 0 {
-				rawArguments[previousArgumentName].values = append(rawArguments[previousArgumentName].values, argument)
-			}
+			res.positional = append(res.positional, arg)
 		}
 	}
 
-	rawArgumentsReturnValue := make([]CoreRawArgument, 0)
-	for _, rawArgument := range rawArguments {
-		values := make([]string, 0)
-		for _, value := range rawArgument.values {
-			if len(value) != 0 {
-				values = append(values, value)
-			}
-		}
-		rawArgument.values = values
-		rawArgumentsReturnValue = append(rawArgumentsReturnValue, *rawArgument)
-	}
+	flushCurrent()
+	return res, nil
+}
 
-	return rawArgumentsReturnValue
+func isMultiValueField(m *fieldMeta) bool {
+	if m == nil {
+		return true
+	}
+	t := m.fieldType
+	if implementsTextUnmarshaler(t) {
+		return false
+	}
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+		if implementsTextUnmarshaler(t) {
+			return false
+		}
+	}
+	return t.Kind() == reflect.Slice || t.Kind() == reflect.Map
+}
+
+func isStringField(m *fieldMeta) bool {
+	if m == nil {
+		return false
+	}
+	t := m.fieldType
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.String
+}
+
+func isExplicitBoolLiteral(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "false":
+		return true
+	default:
+		return false
+	}
+}
+
+func looksLikeNegativeNumber(s string) bool {
+	if len(s) < 2 || s[0] != '-' {
+		return false
+	}
+	r := rune(s[1])
+	return unicode.IsDigit(r) || (r == '.' && len(s) > 2 && unicode.IsDigit(rune(s[2])))
+}
+
+func isBundledShorts(rawShort string, schema *structSchema) bool {
+	for i := 0; i < len(rawShort); i++ {
+		ch := string(rawShort[i])
+		meta, exists := schema.byShort[ch]
+		if !exists {
+			return false
+		}
+		// Only the last flag in a bundle can be non-boolean
+		if i < len(rawShort)-1 && !meta.isBoolean() {
+			return false
+		}
+	}
+	return true
 }
