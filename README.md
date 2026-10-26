@@ -1,15 +1,17 @@
 # confi
 
-Zero-dependency command-line argument, environment variable, and configuration file (`JSON`, `YAML`, `.env`) parser for Go structs.
+Zero-dependency command-line argument, subcommand, environment variable, and configuration file (`JSON`, `YAML`, `TOML`, `INI`, `.env`) parser for Go structs.
 
 ## Features
 
 - **Zero External Dependencies** — Built entirely on the Go standard library.
-- **Unified Precedence Hierarchy** — `Defaults < Config File (JSON / YAML / .env) < Environment Variables < CLI Flags`.
+- **Unified Precedence Hierarchy** — `Defaults < Config File (JSON / YAML / TOML / INI / .env) < Environment Variables < CLI Flags`.
 - **Flexible CLI Syntax** — Supports `--flag=val`, `--flag= val`, `--flag val`, multi-value slices (`--port 80 8080`, `--port 80,8080`, repeated `--port 80 --port 8080`), short flags (`-p 8080`), bundled short booleans (`-alp`), boolean negation (`--no-tls`), and `--` positional argument termination.
-- **Rich Struct Tags** — Configure flag names, short aliases, defaults, environment variable bindings, required field validation, custom list separators, positional arguments, and help text via `confi:"..."` or standalone struct tags.
-- **Rich Type Support** — All Go primitives (`bool`, `string`, `int`..`int64`, `uint`..`uint64`, `uintptr`, `float32`, `float64`), `time.Duration`, `time.Time`, `url.URL`, `regexp.Regexp`, `net.IP`, any `encoding.TextUnmarshaler`, pointers, slices, maps (`map[K]V`), and nested/embedded structs.
-- **Auto-Generated `--help` / `-h`** — Formatted usage and flag documentation out of the box.
+- **Subcommands & `Runner` Hook** — Git/Docker-style subcommands via struct fields tagged `confi:"serve,subcommand"`, with scoped `app serve --help` and automatic `Run() error` execution via `WithAutoRun(true)`.
+- **Declarative & Custom Validation** — Built-in `required`, `oneof=a|b|c`, `min=N`, `max=N`, and `pattern=<regex>` validators plus a `Validator` (`Validate() error`) interface hook.
+- **Secret Redaction & Sample Config Generator** — Mask sensitive fields (`confi:",secret"`) in `confi.Sprint(&cfg)` / `confi.RedactMap(&cfg)` and generate documented `.yaml`, `.toml`, `.json`, or `.env` templates via `confi.GenerateSample`.
+- **Shell Auto-Completion** — Generate completion scripts for `bash`, `zsh`, `fish`, and `powershell` (`confi.Completion` or `WithCompletionFlag("completion")`).
+- **Live Config Reloading** — Watch configuration files for changes in the background with `confi.Watch`.
 
 ## Quick Example
 
@@ -40,6 +42,7 @@ func main() {
 		confi.WithDescription("Packet capture and monitoring service."),
 		confi.WithOptionalConfigFile("config.yaml"),
 		confi.WithConfigFlag("config"),
+		confi.WithCompletionFlag("completion"),
 		confi.WithAutoEnv(),
 	)
 
@@ -67,31 +70,61 @@ You can use either the consolidated `confi:"..."` struct tag or standalone tags:
 | Default Value | `confi:",default=8080"` | `default:"8080"` | Default value applied when field is zero |
 | Environment Variable | `confi:",env=APP_PORT"` | `env:"APP_PORT"` | Environment variable name to bind |
 | Required Validation | `confi:",required"` | `required:"true"` | Returns `*confi.ValidationError` if unset |
-| Help Description | `confi:",usage='Port number'"` | `usage:"Port number"` / `help:"..."` | Description shown in `--help` output |
+| Allowed Values (Enum) | `confi:",oneof=dev\|staging\|prod"` | `oneof:"dev,staging,prod"` / `enum:"..."` | Validates value is one of the allowed choices |
+| Min / Max Bounds | `confi:",min=1,max=65535"` | `min:"1" max:"65535"` | Validates numeric range, string length, or slice/map count |
+| Regex Pattern | `confi:",pattern=^[a-z0-9_]+$"` | `pattern:"..."` / `regex:"..."` | Validates string values against a regular expression |
+| Secret Redaction | `confi:",secret"` | `secret:"true"` | Masks value as `********` in `Dump` / `Sprint` / `RedactMap` |
+| Subcommand | `confi:"serve,subcommand"` | `subcommand:"true"` / `cmd:"serve"` | Registers a struct field as a CLI subcommand |
+| Help Description | `confi:",usage='Port number'"` | `usage:"Port number"` / `help:"..."` | Description shown in `--help` and sample configs |
 | List Separator | `confi:",sep=;"` | `sep:";"` | Custom delimiter for slice/map values (defaults to `,`) |
 | Positional Argument | `confi:",positional"` | `positional:"true"` | Binds non-flag positional CLI arguments |
 | Dynamic Config File | `confi:",config"` | `config:"true"` | Marks a `string` field as a config file path to load |
 | Squash Nested Struct | `confi:",squash"` | — | Flattens nested struct fields into parent namespace |
 | Ignore Field | `confi:"-"` | — | Skips the field completely |
 
-## Configuration Files
-
-`confi` natively parses **JSON**, **YAML**, and **`.env`** files without external dependencies:
+## Subcommands & `Runner`
 
 ```go
-err := confi.Parse(
-	&cfg,
-	confi.WithConfigFile("config.yaml"),          // Required config file (.json, .yaml, .yml, .env)
-	confi.WithOptionalConfigFile(".env"),         // Skipped if file does not exist
-	confi.WithConfigFlag("config"),               // Allows --config <path> on the CLI
-	confi.WithEnvPrefix("APP"),                   // Prefixes env lookups with APP_
-	confi.WithAutoEnv(),                          // Automatically binds UPPER_SNAKE_CASE env vars
-	confi.WithStrict(true),                       // Rejects unknown flags or config keys
-)
+type ServeCmd struct {
+	Port int `confi:"port,short=p,default=8080,usage=Listen port"`
+}
+
+func (s *ServeCmd) Run() error {
+	fmt.Printf("Serving on :%d\n", s.Port)
+	return nil
+}
+
+type CLI struct {
+	Verbose bool      `confi:"verbose,short=v,usage=Enable verbose output"`
+	Serve   *ServeCmd `confi:"serve,subcommand,usage=Start HTTP server"`
+}
+
+func main() {
+	var cli CLI
+	confi.MustParse(&cli, confi.WithName("mycli"), confi.WithAutoRun(true))
+}
+```
+
+## Sample Config Generation, Redaction & Live Watching
+
+```go
+// Generate a documented YAML sample config file
+yamlSample, _ := confi.GenerateSample(&cfg, confi.FormatYAML)
+
+// Safely log configuration with secret fields masked as "********"
+fmt.Println(confi.Sprint(&cfg))
+
+// Watch configuration file for live updates
+watcher, err := confi.Watch(&cfg, func(reloadErr error) {
+	if reloadErr == nil {
+		fmt.Println("Config reloaded:", confi.Sprint(&cfg))
+	}
+}, confi.WithConfigFile("config.toml"))
+defer watcher.Close()
 ```
 
 ## Supported Types
 
 - **Primitives**: `bool`, `string`, `int`, `int8`, `int16`, `int32`, `int64`, `uint`, `uint8`, `uint16`, `uint32`, `uint64`, `uintptr`, `float32`, `float64`
 - **Standard Library & Custom Types**: `time.Duration`, `time.Time`, `url.URL`, `regexp.Regexp`, `net.IP`, and any type implementing `encoding.TextUnmarshaler`
-- **Composites**: Slices (`[]T`), Maps (`map[K]V`), Pointers (`*T`), and Nested / Embedded Structs
+- **Composites**: Slices (`[]T`), Maps (`map[K]V`), Pointers (`*T`), Nested / Embedded Structs, and Subcommand Structs

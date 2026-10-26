@@ -14,10 +14,13 @@ type parsedFlag struct {
 }
 
 type cliParseResult struct {
-	flags          []parsedFlag
-	positional     []string
-	configFilePath string
-	helpRequested  bool
+	flags           []parsedFlag
+	positional      []string
+	configFilePath  string
+	helpRequested   bool
+	completionShell string
+	subcommand      *subcommandMeta
+	subcommandArgs  []string
 }
 
 func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult, error) {
@@ -72,7 +75,6 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 				inlineVal = withoutPrefix[eqIdx+1:]
 				hasInlineVal = true
 			} else {
-				// Support whitespace inside single token if any
 				fields := strings.Fields(withoutPrefix)
 				if len(fields) == 0 {
 					continue
@@ -92,6 +94,19 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 					res.helpRequested = true
 					return res, nil
 				}
+			}
+
+			// Check completion flag (e.g. --completion bash)
+			if p.completionFlag != "" && strings.EqualFold(rawName, p.completionFlag) {
+				if hasInlineVal && inlineVal != "" {
+					res.completionShell = inlineVal
+				} else if i+1 < len(args) {
+					i++
+					res.completionShell = args[i]
+				} else {
+					return nil, &ParseError{Field: rawName, Message: fmt.Sprintf("flag %s%s requires a shell name (bash, zsh, fish, powershell)", prefix, rawName)}
+				}
+				return res, nil
 			}
 
 			// Check dynamic config flag (e.g., --config path.yaml)
@@ -121,7 +136,6 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 				if p.strict {
 					return nil, &ParseError{Field: rawName, Message: fmt.Sprintf("unknown flag %s%s", prefix, rawName)}
 				}
-				// In non-strict mode, consume inline or subsequent non-flag values blindly
 				currentFlag = &parsedFlag{name: rawName}
 				if hasInlineVal && inlineVal != "" {
 					currentFlag.values = append(currentFlag.values, inlineVal)
@@ -163,7 +177,6 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 					})
 					continue
 				}
-				// Check if next token is an explicit boolean literal
 				if i+1 < len(args) && isExplicitBoolLiteral(args[i+1]) {
 					i++
 					res.flags = append(res.flags, parsedFlag{
@@ -181,7 +194,6 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 				continue
 			}
 
-			// Non-boolean long flag
 			currentFlag = &parsedFlag{
 				meta: meta,
 				name: rawName,
@@ -193,7 +205,6 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 						flushCurrent()
 					}
 				} else {
-					// e.g. "--port= 80" where inlineVal is empty and next token has the value
 					expectingValue = true
 				}
 			} else {
@@ -275,7 +286,6 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 							values: []string{val},
 						})
 					} else {
-						// Last bundled short flag can take the remaining inline value or next argument
 						currentFlag = &parsedFlag{
 							meta: meta,
 							name: ch,
@@ -305,14 +315,24 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 			continue
 		}
 
+		// Check if token is a subcommand (when not actively expecting the first value of a flag)
+		if !expectingValue && len(schema.subcommands) > 0 {
+			if subMeta, ok := schema.subcommands[strings.ToLower(arg)]; ok {
+				flushCurrent()
+				res.subcommand = subMeta
+				if i+1 < len(args) {
+					res.subcommandArgs = args[i+1:]
+				}
+				break
+			}
+		}
+
 		// Non-flag token
 		if currentFlag != nil {
 			currentFlag.values = append(currentFlag.values, arg)
 			expectingValue = false
 			if currentFlag.meta != nil && !isMultiValueField(currentFlag.meta) {
-				// If it's a scalar string without positional fields defined, allow multi-word strings if user passes them,
-				// unless positional fields exist in the schema.
-				if isStringField(currentFlag.meta) && len(schema.positionalFields) == 0 {
+				if isStringField(currentFlag.meta) && len(schema.positionalFields) == 0 && len(schema.subcommands) == 0 {
 					continue
 				}
 				flushCurrent()
@@ -378,7 +398,6 @@ func isBundledShorts(rawShort string, schema *structSchema) bool {
 		if !exists {
 			return false
 		}
-		// Only the last flag in a bundle can be non-boolean
 		if i < len(rawShort)-1 && !meta.isBoolean() {
 			return false
 		}

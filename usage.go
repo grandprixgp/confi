@@ -29,13 +29,16 @@ func (p *Parser) WriteUsage(w io.Writer, target interface{}) error {
 	if err != nil {
 		return err
 	}
-	return p.writeSchemaUsage(w, schema)
+	return p.writeSchemaUsage(w, schema, "", p.description)
 }
 
-func (p *Parser) writeSchemaUsage(w io.Writer, schema *structSchema) error {
+func (p *Parser) writeSchemaUsage(w io.Writer, schema *structSchema, subcmdName string, description string) error {
 	appName := p.name
 	if appName == "" {
 		appName = "app"
+	}
+	if subcmdName != "" {
+		appName = appName + " " + subcmdName
 	}
 
 	var posPlaceholders []string
@@ -51,18 +54,44 @@ func (p *Parser) writeSchemaUsage(w io.Writer, schema *structSchema) error {
 	}
 
 	usageLine := fmt.Sprintf("Usage: %s [flags]", appName)
+	if len(schema.subcommandList) > 0 {
+		usageLine += " [command]"
+	}
 	if len(posPlaceholders) > 0 {
 		usageLine += " " + strings.Join(posPlaceholders, " ")
 	}
 	fmt.Fprintln(w, usageLine)
 
-	if p.description != "" {
-		fmt.Fprintf(w, "\n%s\n", p.description)
+	if description != "" {
+		fmt.Fprintf(w, "\n%s\n", description)
 	}
 
 	type row struct {
 		left  string
 		right string
+	}
+
+	if len(schema.subcommandList) > 0 {
+		fmt.Fprintln(w, "\nCommands:")
+		var cmdRows []row
+		maxLeft := 0
+		for _, sub := range schema.subcommandList {
+			left := "  " + sub.name
+			if len(left) > maxLeft {
+				maxLeft = len(left)
+			}
+			cmdRows = append(cmdRows, row{
+				left:  left,
+				right: sub.usage,
+			})
+		}
+		for _, r := range cmdRows {
+			if r.right != "" {
+				fmt.Fprintf(w, "%-*s  %s\n", maxLeft, r.left, r.right)
+			} else {
+				fmt.Fprintln(w, r.left)
+			}
+		}
 	}
 
 	if len(schema.positionalFields) > 0 {
@@ -123,10 +152,17 @@ func (p *Parser) writeSchemaUsage(w io.Writer, schema *structSchema) error {
 		addRow(leftBuf.String(), p.formatFieldDetails(meta))
 	}
 
-	if p.configFlag != "" {
+	if subcmdName == "" && p.configFlag != "" {
 		if _, exists := schema.byFlag[strings.ToLower(p.configFlag)]; !exists {
 			left := fmt.Sprintf("      %s%s <path>", p.prefix, p.configFlag)
-			addRow(left, "Path to configuration file (JSON, YAML, or .env)")
+			addRow(left, "Path to configuration file (JSON, YAML, TOML, or .env)")
+		}
+	}
+
+	if subcmdName == "" && p.completionFlag != "" {
+		if _, exists := schema.byFlag[strings.ToLower(p.completionFlag)]; !exists {
+			left := fmt.Sprintf("      %s%s <shell>", p.prefix, p.completionFlag)
+			addRow(left, "Generate shell completion script (bash, zsh, fish, powershell)")
 		}
 	}
 
@@ -159,6 +195,9 @@ func (p *Parser) formatFieldDetails(meta *fieldMeta) string {
 	}
 	if meta.required {
 		parts = append(parts, "(required)")
+	}
+	if len(meta.oneOf) > 0 {
+		parts = append(parts, fmt.Sprintf("[choices: %s]", strings.Join(meta.oneOf, "|")))
 	}
 	if meta.hasDefault && meta.defaultValue != "" {
 		parts = append(parts, fmt.Sprintf("[default: %s]", meta.defaultValue))
@@ -201,6 +240,9 @@ func formatTypeLabel(t reflect.Type) string {
 	}
 	if t == regexpType {
 		return "regex"
+	}
+	if implementsTextUnmarshaler(t) {
+		return strings.ToLower(t.Name())
 	}
 	switch t.Kind() {
 	case reflect.Slice:

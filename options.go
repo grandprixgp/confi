@@ -2,6 +2,7 @@ package confi
 
 import (
 	"io"
+	"time"
 )
 
 // Format represents a configuration file format.
@@ -16,6 +17,10 @@ const (
 	FormatYAML
 	// FormatEnv parses configuration as a .env (dotenv) file.
 	FormatEnv
+	// FormatTOML parses configuration as TOML.
+	FormatTOML
+	// FormatINI parses configuration as INI (alias compatible with TOML section/key syntax).
+	FormatINI
 )
 
 type configSource struct {
@@ -93,7 +98,7 @@ func WithEnvLookup(fn func(string) (string, bool)) Option {
 	}
 }
 
-// WithConfigFile adds a required configuration file (JSON, YAML, or .env) to load.
+// WithConfigFile adds a required configuration file (JSON, YAML, TOML, INI, or .env) to load.
 func WithConfigFile(path string) Option {
 	return func(p *Parser) {
 		p.configSources = append(p.configSources, configSource{
@@ -104,7 +109,7 @@ func WithConfigFile(path string) Option {
 	}
 }
 
-// WithOptionalConfigFile adds an optional configuration file (JSON, YAML, or .env) to load.
+// WithOptionalConfigFile adds an optional configuration file (JSON, YAML, TOML, INI, or .env) to load.
 // If the file does not exist, it is silently skipped.
 func WithOptionalConfigFile(path string) Option {
 	return func(p *Parser) {
@@ -134,7 +139,7 @@ func WithConfigFlag(flagName string) Option {
 	}
 }
 
-// WithOutput sets the writer used for printing help/usage messages (defaults to os.Stdout).
+// WithOutput sets the writer used for printing help/usage and completion messages (defaults to os.Stdout).
 func WithOutput(w io.Writer) Option {
 	return func(p *Parser) {
 		if w != nil {
@@ -155,5 +160,30 @@ func WithHelpFlag(enabled bool) Option {
 func WithStrict(strict bool) Option {
 	return func(p *Parser) {
 		p.strict = strict
+	}
+}
+
+// WithAutoRun automatically executes the Run() error method on the active subcommand (or root struct)
+// if it implements the Runner interface.
+func WithAutoRun(enabled bool) Option {
+	return func(p *Parser) {
+		p.autoRun = enabled
+	}
+}
+
+// WithCompletionFlag registers a CLI flag (e.g. "completion") that outputs a shell completion script
+// for the requested shell (bash, zsh, fish, powershell) and returns ErrHelp.
+func WithCompletionFlag(flagName string) Option {
+	return func(p *Parser) {
+		p.completionFlag = flagName
+	}
+}
+
+// WithWatchInterval configures the polling interval for Watch (defaults to 500ms).
+func WithWatchInterval(interval time.Duration) Option {
+	return func(p *Parser) {
+		if interval > 0 {
+			p.watchInterval = interval
+		}
 	}
 }

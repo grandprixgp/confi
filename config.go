@@ -56,6 +56,13 @@ func (p *Parser) loadConfigSource(src configSource, schema *structSchema, rootVa
 		}
 		return p.applyStructuredMap(rawMap, schema, rootVal, sources)
 
+	case FormatTOML, FormatINI:
+		rawMap, err := parseTOML(bytes.NewReader(data))
+		if err != nil {
+			return &ParseError{Message: fmt.Sprintf("invalid TOML/INI config: %v", err)}
+		}
+		return p.applyStructuredMap(rawMap, schema, rootVal, sources)
+
 	default:
 		return &ParseError{Message: fmt.Sprintf("unsupported config format: %v", format)}
 	}
@@ -73,6 +80,10 @@ func detectFormat(path string, data []byte, hint Format) Format {
 			return FormatJSON
 		case ".yaml", ".yml":
 			return FormatYAML
+		case ".toml":
+			return FormatTOML
+		case ".ini", ".cfg", ".conf":
+			return FormatINI
 		case ".env":
 			return FormatEnv
 		}
@@ -86,12 +97,15 @@ func detectFormat(path string, data []byte, hint Format) Format {
 		return FormatJSON
 	}
 
-	// Heuristic: check if first non-comment line uses KEY=VALUE rather than YAML key: value
+	// Heuristic: check first non-comment line for [section] (TOML/INI) or KEY=VALUE (.env)
 	scanner := strings.Split(string(trimmed), "\n")
 	for _, line := range scanner {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			return FormatTOML
 		}
 		if strings.Contains(line, "=") && !strings.Contains(line, ": ") && !strings.HasSuffix(line, ":") {
 			return FormatEnv

@@ -609,3 +609,315 @@ func TestEdgeCasesAndErrorPaths(t *testing.T) {
 	}
 }
 
+type serveSubcmd struct {
+	Port   int  `confi:"port,short=p,default=8080,usage=HTTP listen port"`
+	ran    bool
+}
+
+func (s *serveSubcmd) Run() error {
+	s.ran = true
+	return nil
+}
+
+type migrateSubcmd struct {
+	Steps int    `confi:"steps,default=1,usage=Number of migrations"`
+	Dir   string `confi:"dir,positional,required,usage=Migration directory"`
+}
+
+func TestSubcommandsAndRunner(t *testing.T) {
+	type AppCLI struct {
+		Verbose bool           `confi:"verbose,short=v,usage=Global verbose mode"`
+		Serve   *serveSubcmd   `confi:"serve,subcommand,usage=Start the web server"`
+		Migrate *migrateSubcmd `confi:"migrate,subcommand,usage=Run database migrations"`
+	}
+
+	// 1. Test `app -v serve -p 9090` with WithAutoRun(true)
+	var cli1 AppCLI
+	p1 := NewParser("app", WithAutoRun(true), WithArgs([]string{"-v", "serve", "-p", "9090"}))
+	if err := p1.Parse(&cli1); err != nil {
+		t.Fatalf("subcommand serve Parse failed: %v", err)
+	}
+	if p1.ActiveCommand() != "serve" {
+		t.Errorf("expected ActiveCommand 'serve', got %q", p1.ActiveCommand())
+	}
+	if !cli1.Verbose || cli1.Serve == nil || cli1.Serve.Port != 9090 || !cli1.Serve.ran {
+		t.Errorf("unexpected cli1 state: verbose=%v serve=%+v", cli1.Verbose, cli1.Serve)
+	}
+	if cli1.Migrate != nil {
+		t.Errorf("expected unused subcommand Migrate to remain nil")
+	}
+
+	// 2. Test `app migrate --steps 3 ./migrations`
+	var cli2 AppCLI
+	p2 := NewParser("app", WithArgs([]string{"migrate", "--steps", "3", "./migrations"}))
+	if err := p2.Parse(&cli2); err != nil {
+		t.Fatalf("subcommand migrate Parse failed: %v", err)
+	}
+	if p2.ActiveCommand() != "migrate" || cli2.Migrate == nil || cli2.Migrate.Steps != 3 || cli2.Migrate.Dir != "./migrations" {
+		t.Errorf("unexpected cli2 Migrate state: %+v", cli2.Migrate)
+	}
+
+	// 3. Test scoped subcommand `--help` (`app serve --help`)
+	var cli3 AppCLI
+	var helpBuf bytes.Buffer
+	err := Parse(&cli3, WithName("app"), WithOutput(&helpBuf), WithArgs([]string{"serve", "--help"}))
+	if err != ErrHelp {
+		t.Fatalf("expected ErrHelp for subcommand help, got %v", err)
+	}
+	if !strings.Contains(helpBuf.String(), "Usage: app serve [flags]") || !strings.Contains(helpBuf.String(), "--port <int>") {
+		t.Errorf("unexpected subcommand help output:\n%s", helpBuf.String())
+	}
+
+	// 4. Test root `--help` shows Commands section
+	helpBuf.Reset()
+	err = Parse(&cli3, WithName("app"), WithOutput(&helpBuf), WithArgs([]string{"--help"}))
+	if err != ErrHelp {
+		t.Fatalf("expected ErrHelp, got %v", err)
+	}
+	if !strings.Contains(helpBuf.String(), "Commands:") || !strings.Contains(helpBuf.String(), "serve") || !strings.Contains(helpBuf.String(), "migrate") {
+		t.Errorf("expected root help output to list Commands:\n%s", helpBuf.String())
+	}
+}
+
+type validatedStruct struct {
+	Env      string   `confi:"env,oneof=dev|staging|prod,default=dev"`
+	Port     int      `confi:"port,min=1024,max=65535,default=8080"`
+	Username string   `confi:"username,min=3,max=16,pattern=^[a-z0-9_]+$,default=admin_1"`
+	Tags     []string `confi:"tags,min=1,max=3,default='a,b'"`
+	MaxConn  int      `confi:"max-conn,default=10"`
+	MinConn  int      `confi:"min-conn,default=2"`
+}
+
+func (v *validatedStruct) Validate() error {
+	if v.MinConn > v.MaxConn {
+		return &ParseError{Field: "MinConn", Message: "min-conn cannot exceed max-conn"}
+	}
+	return nil
+}
+
+func TestValidationRulesAndCustomValidator(t *testing.T) {
+	var validCfg validatedStruct
+	if err := Parse(&validCfg, WithArgs(nil)); err != nil {
+		t.Fatalf("expected valid default config to pass, got: %v", err)
+	}
+
+	// Test invalid oneof
+	var c1 validatedStruct
+	if err := Parse(&c1, WithArgs([]string{"--env=invalid"})); err == nil || !strings.Contains(err.Error(), "must be one of") {
+		t.Errorf("expected oneof error, got: %v", err)
+	}
+
+	// Test invalid numeric min/max
+	var c2 validatedStruct
+	if err := Parse(&c2, WithArgs([]string{"--port=80"})); err == nil || !strings.Contains(err.Error(), "less than minimum") {
+		t.Errorf("expected min error for port=80, got: %v", err)
+	}
+
+	// Test invalid string length min
+	var c3 validatedStruct
+	if err := Parse(&c3, WithArgs([]string{"--username=ab"})); err == nil || !strings.Contains(err.Error(), "length 2 is less than minimum") {
+		t.Errorf("expected string min length error, got: %v", err)
+	}
+
+	// Test invalid regex pattern
+	var c4 validatedStruct
+	if err := Parse(&c4, WithArgs([]string{"--username=INVALID-USER!"})); err == nil || !strings.Contains(err.Error(), "does not match pattern") {
+		t.Errorf("expected regex pattern error, got: %v", err)
+	}
+
+	// Test invalid slice count max
+	var c5 validatedStruct
+	if err := Parse(&c5, WithArgs([]string{"--tags=a,b,c,d"})); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Errorf("expected slice max count error, got: %v", err)
+	}
+
+	// Test custom Validator interface
+	var c6 validatedStruct
+	if err := Parse(&c6, WithArgs([]string{"--min-conn=50", "--max-conn=10"})); err == nil || !strings.Contains(err.Error(), "min-conn cannot exceed max-conn") {
+		t.Errorf("expected custom Validator error, got: %v", err)
+	}
+}
+
+func TestTOMLAndINIConfig(t *testing.T) {
+	type ServerSection struct {
+		Host  string   `toml:"host"`
+		Port  int      `toml:"port"`
+		Peers []string `toml:"peers"`
+	}
+	type TOMLConfig struct {
+		Title       string            `confi:"title"`
+		Description string            `confi:"description"`
+		Server      ServerSection     `confi:"server"`
+		Labels      map[string]string `confi:"labels"`
+	}
+
+	tomlContent := `
+# Sample TOML configuration
+title = "Confi TOML App"
+description = """
+Multi-line
+TOML description"""
+labels = { env = "prod", region = "us-west" }
+
+[server]
+host = "10.0.0.5" ; inline comment
+port = 8443
+peers = [
+  "10.0.0.6",
+  "10.0.0.7"
+]
+`
+	var cfg TOMLConfig
+	err := Parse(&cfg, WithConfigReader(strings.NewReader(tomlContent), FormatTOML), WithArgs(nil))
+	if err != nil {
+		t.Fatalf("TOML Parse failed: %v", err)
+	}
+	if cfg.Title != "Confi TOML App" || cfg.Description != "Multi-line\nTOML description" {
+		t.Errorf("unexpected Title/Description: %+v", cfg)
+	}
+	if cfg.Server.Host != "10.0.0.5" || cfg.Server.Port != 8443 || !reflect.DeepEqual(cfg.Server.Peers, []string{"10.0.0.6", "10.0.0.7"}) {
+		t.Errorf("unexpected Server section: %+v", cfg.Server)
+	}
+	if cfg.Labels["env"] != "prod" || cfg.Labels["region"] != "us-west" {
+		t.Errorf("unexpected Labels: %v", cfg.Labels)
+	}
+}
+
+func TestSecretRedactionAndSampleGeneration(t *testing.T) {
+	type DB struct {
+		Host     string `confi:"host,default=db.local,usage=Database host"`
+		Password string `confi:"password,secret,required,env=DB_PASS,usage=Database password"`
+	}
+	type SampleApp struct {
+		Env  string `confi:"env,default=prod,oneof=dev|staging|prod,usage=Deployment environment"`
+		Port int    `confi:"port,default=8080,usage=HTTP port"`
+		DB   DB     `confi:"db"`
+	}
+
+	cfg := SampleApp{
+		Env:  "prod",
+		Port: 8080,
+		DB:   DB{Host: "db.local", Password: "super-secret-password"},
+	}
+
+	dumped := Sprint(&cfg)
+	if strings.Contains(dumped, "super-secret-password") || !strings.Contains(dumped, "********") {
+		t.Errorf("expected secret password to be masked in Sprint output:\n%s", dumped)
+	}
+
+	redactedMap, err := RedactMap(&cfg)
+	if err != nil {
+		t.Fatalf("RedactMap failed: %v", err)
+	}
+	dbMap := redactedMap["db"].(map[string]interface{})
+	if dbMap["password"] != "********" {
+		t.Errorf("expected redacted map password '********', got %v", dbMap["password"])
+	}
+
+	for _, fmtType := range []Format{FormatYAML, FormatJSON, FormatTOML, FormatEnv} {
+		sample, err := GenerateSample(&cfg, fmtType, WithDescription("Sample App Configuration"))
+		if err != nil {
+			t.Fatalf("GenerateSample(%v) failed: %v", fmtType, err)
+		}
+		if strings.Contains(sample, "super-secret-password") {
+			t.Errorf("GenerateSample(%v) leaked secret value:\n%s", fmtType, sample)
+		}
+		if len(sample) == 0 {
+			t.Errorf("GenerateSample(%v) returned empty output", fmtType)
+		}
+	}
+}
+
+func TestShellCompletions(t *testing.T) {
+	type Sub struct {
+		Fast bool `confi:"fast,short=f,usage=Run fast"`
+	}
+	type CompStruct struct {
+		Mode string `confi:"mode,short=m,oneof=auto|manual,usage=Execution mode"`
+		Run  *Sub   `confi:"run,subcommand,usage=Execute job"`
+	}
+
+	var cfg CompStruct
+	for _, sh := range []string{"bash", "zsh", "fish", "powershell"} {
+		script, err := Completion(sh, &cfg, WithName("mycli"))
+		if err != nil {
+			t.Fatalf("Completion(%q) failed: %v", sh, err)
+		}
+		if !strings.Contains(script, "mycli") || !strings.Contains(script, "mode") {
+			t.Errorf("Completion(%q) missing expected tokens:\n%s", sh, script)
+		}
+	}
+
+	// Test WithCompletionFlag
+	var buf bytes.Buffer
+	err := Parse(&cfg, WithName("mycli"), WithCompletionFlag("completion"), WithOutput(&buf), WithArgs([]string{"--completion", "bash"}))
+	if err != ErrHelp {
+		t.Fatalf("expected ErrHelp when invoking --completion, got %v", err)
+	}
+	if !strings.Contains(buf.String(), "_mycli_completions") {
+		t.Errorf("unexpected completion flag output:\n%s", buf.String())
+	}
+}
+
+func TestLiveConfigWatcher(t *testing.T) {
+	type WatchedCfg struct {
+		Host string `confi:"host,default=localhost"`
+		Port int    `confi:"port,default=8080"`
+	}
+
+	tmpDir, err := ioutil.TempDir("", "confi_watch_")
+	if err != nil {
+		t.Fatalf("TempDir failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfgPath := filepath.Join(tmpDir, "watch.yaml")
+	if err := ioutil.WriteFile(cfgPath, []byte("host: initial.local\nport: 8000\n"), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	var cfg WatchedCfg
+	changeCh := make(chan error, 4)
+
+	watcher, err := Watch(
+		&cfg,
+		func(reloadErr error) {
+			changeCh <- reloadErr
+		},
+		WithConfigFile(cfgPath),
+		WithWatchInterval(20*time.Millisecond),
+		WithArgs(nil),
+	)
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+	defer watcher.Close()
+
+	if cfg.Host != "initial.local" || cfg.Port != 8000 {
+		t.Errorf("unexpected initial watched config: %+v", cfg)
+	}
+
+	// Update config file on disk
+	if err := ioutil.WriteFile(cfgPath, []byte("host: updated.local\nport: 9090\n"), 0600); err != nil {
+		t.Fatalf("WriteFile update failed: %v", err)
+	}
+
+	select {
+	case reloadErr := <-changeCh:
+		if reloadErr != nil {
+			t.Fatalf("unexpected reload error: %v", reloadErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for Watch reload callback")
+	}
+
+	watcher.RLock()
+	host, port := cfg.Host, cfg.Port
+	watcher.RUnlock()
+
+	if host != "updated.local" || port != 9090 {
+		t.Errorf("expected reloaded config updated.local:9090, got %s:%d", host, port)
+	}
+}
+
+

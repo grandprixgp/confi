@@ -1,5 +1,5 @@
-// Package confi provides a zero-dependency command-line flag, environment variable,
-// and configuration file (JSON, YAML, .env) parser for Go structs.
+// Package confi provides a zero-dependency command-line flag, subcommand, environment variable,
+// and configuration file (JSON, YAML, TOML, INI, .env) parser for Go structs.
 package confi
 
 import (
@@ -10,9 +10,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 )
 
-// ErrHelp is returned by Parse when -h or --help is invoked.
+// ErrHelp is returned by Parse when -h, --help, or a completion flag is invoked.
 var ErrHelp = errors.New("confi: help requested")
 
 type valueSource int
@@ -50,21 +51,25 @@ func (e *ValidationError) Error() string {
 
 // Parser holds configuration settings for parsing structs.
 type Parser struct {
-	name          string
-	description   string
-	prefix        string
-	shortPrefix   string
-	args          []string
-	hasCustomArgs bool
-	envPrefix     string
-	autoEnv       bool
-	lookupEnv     func(string) (string, bool)
-	configSources []configSource
-	configFlag    string
-	output        io.Writer
-	helpEnabled   bool
-	strict        bool
-	exitFunc      func(int)
+	name           string
+	description    string
+	prefix         string
+	shortPrefix    string
+	args           []string
+	hasCustomArgs  bool
+	envPrefix      string
+	autoEnv        bool
+	lookupEnv      func(string) (string, bool)
+	configSources  []configSource
+	configFlag     string
+	completionFlag string
+	output         io.Writer
+	helpEnabled    bool
+	strict         bool
+	autoRun        bool
+	watchInterval  time.Duration
+	activeCommand  string
+	exitFunc       func(int)
 }
 
 // NewParser creates a new Parser with the given application name and functional options.
@@ -74,13 +79,14 @@ func NewParser(name string, opts ...Option) *Parser {
 		defaultName = filepath.Base(os.Args[0])
 	}
 	p := &Parser{
-		name:        defaultName,
-		prefix:      "--",
-		shortPrefix: "-",
-		lookupEnv:   os.LookupEnv,
-		output:      os.Stdout,
-		helpEnabled: true,
-		exitFunc:    os.Exit,
+		name:          defaultName,
+		prefix:        "--",
+		shortPrefix:   "-",
+		lookupEnv:     os.LookupEnv,
+		output:        os.Stdout,
+		helpEnabled:   true,
+		watchInterval: 500 * time.Millisecond,
+		exitFunc:      os.Exit,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -88,6 +94,12 @@ func NewParser(name string, opts ...Option) *Parser {
 		}
 	}
 	return p
+}
+
+// ActiveCommand returns the name of the subcommand invoked during the most recent Parse call,
+// or an empty string if no subcommand was invoked.
+func (p *Parser) ActiveCommand() string {
+	return p.activeCommand
 }
 
 // Parse populates target (a non-nil pointer to a struct) from defaults, config files,
@@ -126,18 +138,91 @@ func (p *Parser) Parse(target interface{}) error {
 
 // ParseArgs populates target using the Parser's configured options and the explicit args slice.
 func (p *Parser) ParseArgs(target interface{}, args []string) error {
+	p.activeCommand = ""
 	schema, rootVal, err := extractSchema(target)
 	if err != nil {
 		return err
 	}
 
+	if err := p.parseIntoSchema(schema, rootVal, args, "", true); err != nil {
+		return err
+	}
+
+	if err := invokeCustomValidators(rootVal); err != nil {
+		return err
+	}
+
+	if p.autoRun {
+		return p.RunCommand(target)
+	}
+	return nil
+}
+
+// RunCommand executes the Run() error method on the active subcommand if it implements Runner,
+// or on target itself if target implements Runner.
+func (p *Parser) RunCommand(target interface{}) error {
+	schema, rootVal, err := extractSchema(target)
+	if err != nil {
+		return err
+	}
+
+	if p.activeCommand != "" {
+		if subMeta, ok := schema.subcommands[strings.ToLower(p.activeCommand)]; ok {
+			if subVal, ok := resolveIndexPath(rootVal, subMeta.indexPath, false); ok {
+				if r, ok := extractRunner(subVal); ok {
+					return r.Run()
+				}
+			}
+		}
+	}
+
+	if r, ok := extractRunner(rootVal); ok {
+		return r.Run()
+	}
+	return nil
+}
+
+func extractRunner(v reflect.Value) (Runner, bool) {
+	if !v.IsValid() {
+		return nil, false
+	}
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return nil, false
+		}
+		if v.Type().Implements(runnerType) {
+			return v.Interface().(Runner), true
+		}
+		v = v.Elem()
+	}
+	if v.CanAddr() && v.Addr().Type().Implements(runnerType) {
+		return v.Addr().Interface().(Runner), true
+	}
+	if v.Type().Implements(runnerType) {
+		return v.Interface().(Runner), true
+	}
+	return nil, false
+}
+
+func (p *Parser) parseIntoSchema(schema *structSchema, rootVal reflect.Value, args []string, subcmdName string, allowConfigFiles bool) error {
 	cliRes, err := p.parseCLI(args, schema)
 	if err != nil {
 		return err
 	}
 
+	if cliRes.completionShell != "" {
+		if err := p.writeSchemaCompletion(p.output, cliRes.completionShell, schema); err != nil {
+			return err
+		}
+		return ErrHelp
+	}
+
 	if cliRes.helpRequested {
-		_ = p.writeSchemaUsage(p.output, schema)
+		desc := p.description
+		if subcmdName != "" {
+			desc = ""
+		}
+		_ = p.writeSchemaUsage(p.output, schema, subcmdName, desc)
 		return ErrHelp
 	}
 
@@ -163,34 +248,35 @@ func (p *Parser) ParseArgs(target interface{}, args []string) error {
 		sources[meta] = sourceDefault
 	}
 
-	// 2. Collect config sources (static + dynamic CLI flag / struct config field)
-	allSources := make([]configSource, len(p.configSources))
-	copy(allSources, p.configSources)
+	// 2. Collect and load config sources (for root struct)
+	if allowConfigFiles {
+		allSources := make([]configSource, len(p.configSources))
+		copy(allSources, p.configSources)
 
-	if cliRes.configFilePath != "" {
-		allSources = append(allSources, configSource{
-			path:   cliRes.configFilePath,
-			format: FormatAuto,
-		})
-	}
-
-	if schema.configFileField != nil {
-		if dynPath := p.resolveConfigFieldPath(schema.configFileField, rootVal, cliRes); dynPath != "" {
+		if cliRes.configFilePath != "" {
 			allSources = append(allSources, configSource{
-				path:   dynPath,
+				path:   cliRes.configFilePath,
 				format: FormatAuto,
 			})
 		}
-	}
 
-	// 3. Load and apply config files/streams
-	for _, src := range allSources {
-		if err := p.loadConfigSource(src, schema, rootVal, sources); err != nil {
-			return err
+		if schema.configFileField != nil {
+			if dynPath := p.resolveConfigFieldPath(schema.configFileField, rootVal, cliRes); dynPath != "" {
+				allSources = append(allSources, configSource{
+					path:   dynPath,
+					format: FormatAuto,
+				})
+			}
+		}
+
+		for _, src := range allSources {
+			if err := p.loadConfigSource(src, schema, rootVal, sources); err != nil {
+				return err
+			}
 		}
 	}
 
-	// 4. Apply environment variables
+	// 3. Apply environment variables
 	for _, meta := range schema.fields {
 		candidates := p.envCandidatesForField(meta, p.autoEnv)
 		for _, envKey := range candidates {
@@ -209,7 +295,7 @@ func (p *Parser) ParseArgs(target interface{}, args []string) error {
 		}
 	}
 
-	// 5. Apply CLI flags
+	// 4. Apply CLI flags
 	for _, pf := range cliRes.flags {
 		if pf.meta == nil {
 			continue
@@ -226,47 +312,41 @@ func (p *Parser) ParseArgs(target interface{}, args []string) error {
 		sources[pf.meta] = sourceCLI
 	}
 
-	// 6. Apply positional CLI arguments
+	// 5. Apply positional CLI arguments
 	if err := p.applyPositionalArgs(cliRes.positional, schema, rootVal, sources); err != nil {
 		return err
 	}
 
-	// 7. Validate required fields
-	var missing []string
-	for _, meta := range schema.fields {
-		if !meta.required {
-			continue
-		}
-		fv, ok := meta.fieldValue(rootVal, false)
-		if !ok || (sources[meta] == sourceNone && isZeroValue(fv)) || isZeroValue(fv) {
-			// Note: a boolean required field that was explicitly set to false is valid if sources[meta] != sourceNone
-			if meta.isBoolean() && sources[meta] != sourceNone {
-				continue
+	// 6. If a subcommand was invoked, parse into the subcommand struct first (so subcommand --help works even if global required fields are checked or after)
+	if cliRes.subcommand != nil {
+		p.activeCommand = cliRes.subcommand.name
+		subVal, _ := resolveIndexPath(rootVal, cliRes.subcommand.indexPath, true)
+		if subVal.Kind() == reflect.Ptr {
+			if subVal.IsNil() {
+				subVal.Set(reflect.New(subVal.Type().Elem()))
 			}
-			missing = append(missing, meta.flagName)
+			subVal = subVal.Elem()
 		}
-	}
-	if len(missing) > 0 {
-		return &ValidationError{MissingFields: missing}
+		if err := p.parseIntoSchema(cliRes.subcommand.schema, subVal, cliRes.subcommandArgs, cliRes.subcommand.name, false); err != nil {
+			return err
+		}
 	}
 
-	return nil
+	// 7. Validate required fields, constraint tags (oneof, min, max, pattern), and custom Validator
+	return validateSchemaFields(schema, rootVal, sources)
 }
 
 func (p *Parser) resolveConfigFieldPath(meta *fieldMeta, rootVal reflect.Value, cliRes *cliParseResult) string {
-	// Check CLI flags first
 	for i := len(cliRes.flags) - 1; i >= 0; i-- {
 		if cliRes.flags[i].meta == meta && len(cliRes.flags[i].values) > 0 {
 			return cliRes.flags[i].values[len(cliRes.flags[i].values)-1]
 		}
 	}
-	// Check environment variables
 	for _, envKey := range p.envCandidatesForField(meta, p.autoEnv) {
 		if val, ok := p.lookupEnv(envKey); ok && val != "" {
 			return val
 		}
 	}
-	// Check initial/default field value
 	if fv, ok := meta.fieldValue(rootVal, false); ok && fv.Kind() == reflect.String {
 		return fv.String()
 	}
