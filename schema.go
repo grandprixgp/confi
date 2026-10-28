@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -19,6 +20,33 @@ var (
 	urlType             = reflect.TypeOf(url.URL{})
 	regexpType          = reflect.TypeOf(regexp.Regexp{})
 )
+
+var (
+	schemaCache    sync.Map // map[reflect.Type]*structSchema
+	regexCacheLock sync.RWMutex
+	regexCache     = make(map[string]*regexp.Regexp)
+)
+
+func compileRegex(pattern string) (*regexp.Regexp, error) {
+	regexCacheLock.RLock()
+	re, ok := regexCache[pattern]
+	regexCacheLock.RUnlock()
+	if ok {
+		return re, nil
+	}
+	regexCacheLock.Lock()
+	defer regexCacheLock.Unlock()
+	if re, ok = regexCache[pattern]; ok {
+		return re, nil
+	}
+	var err error
+	re, err = regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	regexCache[pattern] = re
+	return re, nil
+}
 
 // fieldMeta holds metadata extracted from a struct field and its tags.
 type fieldMeta struct {
@@ -89,6 +117,9 @@ func extractSchema(target interface{}) (*structSchema, reflect.Value, error) {
 }
 
 func buildSchemaForType(t reflect.Type) (*structSchema, error) {
+	if cached, ok := schemaCache.Load(t); ok {
+		return cached.(*structSchema), nil
+	}
 	schema := &structSchema{
 		byFlag:      make(map[string]*fieldMeta),
 		byShort:     make(map[string]*fieldMeta),
@@ -98,6 +129,7 @@ func buildSchemaForType(t reflect.Type) (*structSchema, error) {
 	if err := walkStructType(t, nil, nil, nil, schema, visited); err != nil {
 		return nil, err
 	}
+	schemaCache.Store(t, schema)
 	return schema, nil
 }
 
@@ -611,7 +643,7 @@ func buildFieldMeta(sf reflect.StructField, indexPath []int, namePrefix []string
 	}
 	var compiledPattern *regexp.Regexp
 	if pattern != "" {
-		re, err := regexp.Compile(pattern)
+		re, err := compileRegex(pattern)
 		if err != nil {
 			return nil, &ParseError{Field: fullFieldName, Message: fmt.Sprintf("invalid regex pattern %q: %v", pattern, err)}
 		}

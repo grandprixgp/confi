@@ -13,6 +13,7 @@ import (
 type Watcher struct {
 	parser   *Parser
 	target   interface{}
+	initial  reflect.Value
 	onChange func(error)
 	interval time.Duration
 	stopCh   chan struct{}
@@ -47,9 +48,14 @@ func (p *Parser) Watch(target interface{}, onChange func(error)) (*Watcher, erro
 		interval = 500 * time.Millisecond
 	}
 
+	elemVal := reflect.ValueOf(target).Elem()
+	initialCopy := reflect.New(elemVal.Type())
+	initialCopy.Elem().Set(elemVal)
+
 	w := &Watcher{
 		parser:   p,
 		target:   target,
+		initial:  initialCopy.Elem(),
 		onChange: onChange,
 		interval: interval,
 		stopCh:   make(chan struct{}),
@@ -57,7 +63,7 @@ func (p *Parser) Watch(target interface{}, onChange func(error)) (*Watcher, erro
 	}
 
 	paths := p.collectWatchedFiles(target)
-	snapshots := takeSnapshots(paths)
+	snapshots := takeSnapshots(paths, nil)
 
 	go w.loop(paths, snapshots)
 	return w, nil
@@ -97,11 +103,13 @@ func (w *Watcher) loop(paths []string, snapshots map[string]fileSnapshot) {
 		case <-w.stopCh:
 			return
 		case <-ticker.C:
+			w.mu.RLock()
 			currentPaths := w.parser.collectWatchedFiles(w.target)
+			w.mu.RUnlock()
 			if len(currentPaths) > 0 {
 				paths = currentPaths
 			}
-			nextSnaps := takeSnapshots(paths)
+			nextSnaps := takeSnapshots(paths, snapshots)
 			if !snapshotsChanged(snapshots, nextSnaps) {
 				continue
 			}
@@ -109,6 +117,7 @@ func (w *Watcher) loop(paths []string, snapshots map[string]fileSnapshot) {
 
 			elemType := reflect.ValueOf(w.target).Elem().Type()
 			freshPtr := reflect.New(elemType)
+			freshPtr.Elem().Set(w.initial)
 			err := w.parser.Parse(freshPtr.Interface())
 			if err == nil {
 				w.mu.Lock()
@@ -149,7 +158,7 @@ func (p *Parser) collectWatchedFiles(target interface{}) []string {
 	return paths
 }
 
-func takeSnapshots(paths []string) map[string]fileSnapshot {
+func takeSnapshots(paths []string, prev map[string]fileSnapshot) map[string]fileSnapshot {
 	snaps := make(map[string]fileSnapshot, len(paths))
 	for _, path := range paths {
 		info, err := os.Stat(path)
@@ -157,6 +166,16 @@ func takeSnapshots(paths []string) map[string]fileSnapshot {
 			snaps[path] = fileSnapshot{exists: false}
 			continue
 		}
+		modTime := info.ModTime()
+		size := info.Size()
+
+		if prev != nil {
+			if prevSnap, ok := prev[path]; ok && prevSnap.exists && prevSnap.size == size && prevSnap.modTime.Equal(modTime) {
+				snaps[path] = prevSnap
+				continue
+			}
+		}
+
 		data, err := ioutil.ReadFile(path)
 		if err != nil {
 			snaps[path] = fileSnapshot{exists: false}
@@ -164,8 +183,8 @@ func takeSnapshots(paths []string) map[string]fileSnapshot {
 		}
 		snaps[path] = fileSnapshot{
 			exists:  true,
-			modTime: info.ModTime(),
-			size:    info.Size(),
+			modTime: modTime,
+			size:    size,
 			content: data,
 		}
 	}
@@ -181,7 +200,7 @@ func snapshotsChanged(prev, next map[string]fileSnapshot) bool {
 		if !ok {
 			return true
 		}
-		if pSnap.exists != nSnap.exists || pSnap.size != nSnap.size || !bytes.Equal(pSnap.content, nSnap.content) {
+		if pSnap.exists != nSnap.exists || pSnap.size != nSnap.size || !pSnap.modTime.Equal(nSnap.modTime) || !bytes.Equal(pSnap.content, nSnap.content) {
 			return true
 		}
 	}

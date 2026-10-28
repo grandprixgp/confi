@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -12,21 +13,34 @@ import (
 	"strings"
 )
 
+const maxConfigSize = 10 << 20 // 10MB default cap
+
 func (p *Parser) loadConfigSource(src configSource, schema *structSchema, rootVal reflect.Value, sources map[*fieldMeta]valueSource) error {
 	var data []byte
 	var err error
 
 	if src.reader != nil {
-		data, err = ioutil.ReadAll(src.reader)
+		limitR := io.LimitReader(src.reader, maxConfigSize+1)
+		data, err = ioutil.ReadAll(limitR)
 		if err != nil {
 			return &ParseError{Message: fmt.Sprintf("failed to read config stream: %v", err)}
 		}
+		if int64(len(data)) > maxConfigSize {
+			return &ParseError{Message: fmt.Sprintf("config stream exceeds maximum limit of %d bytes", maxConfigSize)}
+		}
 	} else if src.path != "" {
-		data, err = ioutil.ReadFile(src.path)
-		if err != nil {
-			if os.IsNotExist(err) && src.optional {
+		st, statErr := os.Stat(src.path)
+		if statErr != nil {
+			if os.IsNotExist(statErr) && src.optional {
 				return nil
 			}
+			return &ParseError{Message: fmt.Sprintf("failed to read config file %q: %v", src.path, statErr)}
+		}
+		if st.Size() > maxConfigSize {
+			return &ParseError{Message: fmt.Sprintf("config file %q exceeds maximum limit of %d bytes", src.path, maxConfigSize)}
+		}
+		data, err = ioutil.ReadFile(src.path)
+		if err != nil {
 			return &ParseError{Message: fmt.Sprintf("failed to read config file %q: %v", src.path, err)}
 		}
 	} else {

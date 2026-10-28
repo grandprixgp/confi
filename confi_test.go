@@ -2,6 +2,7 @@ package confi
 
 import (
 	"bytes"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/url"
@@ -1129,4 +1130,104 @@ port = 8002
 	if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("MAJ-20 failed: expected max duration error for 10s, got: %v", err)
 	}
+}
+
+func TestPhase3PerformanceAndWatcher(t *testing.T) {
+	// 1. Memory limit on reader (MAJ-17)
+	type SimpleCfg struct {
+		Name string `confi:"name"`
+	}
+	var s SimpleCfg
+	hugeReader := io.LimitReader(bytes.NewReader(bytes.Repeat([]byte("name=foo\n"), 2000000)), 11<<20)
+	err := Parse(&s, WithConfigReader(hugeReader, FormatEnv), WithArgs(nil))
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum limit") {
+		t.Fatalf("MAJ-17 failed: expected limit error, got: %v", err)
+	}
+
+	// 2. Schema caching (MAJ-26)
+	var s1, s2 SimpleCfg
+	if err := Parse(&s1, WithArgs([]string{"--name=alpha"})); err != nil {
+		t.Fatalf("Parse s1 failed: %v", err)
+	}
+	if err := Parse(&s2, WithArgs([]string{"--name=beta"})); err != nil {
+		t.Fatalf("Parse s2 failed: %v", err)
+	}
+	cached, ok := schemaCache.Load(reflect.TypeOf(s1))
+	if !ok || cached == nil {
+		t.Fatalf("MAJ-26 failed: schema was not cached in schemaCache")
+	}
+
+	// 3. Watcher programmatic defaults preservation (MAJ-19) & thread safety (MAJ-18)
+	tmpDir, err := ioutil.TempDir("", "confi_watch_p3_")
+	if err != nil {
+		t.Fatalf("TempDir failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	if err := ioutil.WriteFile(cfgPath, []byte(`{"workers": 5}`), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	type AppCfg struct {
+		Workers         int           `confi:"workers"`
+		ProgrammaticDef time.Duration // programmatic default without tag
+	}
+
+	app := AppCfg{
+		ProgrammaticDef: 42 * time.Second,
+	}
+
+	ch := make(chan error, 1)
+	watcher, err := Watch(&app, func(e error) {
+		ch <- e
+	}, WithConfigFile(cfgPath), WithWatchInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+	defer watcher.Close()
+
+	if app.Workers != 5 || app.ProgrammaticDef != 42*time.Second {
+		t.Fatalf("initial watch parse mismatch: workers=%d, prog=%v", app.Workers, app.ProgrammaticDef)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				watcher.RLock()
+				_ = app.Workers
+				_ = app.ProgrammaticDef
+				watcher.RUnlock()
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := ioutil.WriteFile(cfgPath, []byte(`{"workers": 10}`), 0644); err != nil {
+		t.Fatalf("WriteFile update failed: %v", err)
+	}
+
+	select {
+	case reloadErr := <-ch:
+		if reloadErr != nil {
+			t.Fatalf("reload reported error: %v", reloadErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for reload notification")
+	}
+
+	close(done)
+	watcher.RLock()
+	if app.Workers != 10 {
+		t.Fatalf("expected workers=10, got %d", app.Workers)
+	}
+	if app.ProgrammaticDef != 42*time.Second {
+		t.Fatalf("MAJ-19 failed: programmatic default erased! expected 42s, got %v", app.ProgrammaticDef)
+	}
+	watcher.RUnlock()
 }
