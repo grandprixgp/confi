@@ -69,6 +69,7 @@ type Parser struct {
 	configFlag     string
 	completionFlag string
 	output         io.Writer
+	errOutput      io.Writer
 	helpEnabled    bool
 	strict         bool
 	autoRun        bool
@@ -89,6 +90,7 @@ func NewParser(name string, opts ...Option) *Parser {
 		shortPrefix:   "-",
 		lookupEnv:     os.LookupEnv,
 		output:        os.Stdout,
+		errOutput:     os.Stderr,
 		helpEnabled:   true,
 		watchInterval: 500 * time.Millisecond,
 		exitFunc:      os.Exit,
@@ -123,7 +125,11 @@ func MustParse(target interface{}, opts ...Option) {
 			p.exitFunc(0)
 			return
 		}
-		fmt.Fprintln(p.output, err)
+		errW := p.errOutput
+		if errW == nil {
+			errW = p.output
+		}
+		fmt.Fprintln(errW, err)
 		p.exitFunc(1)
 	}
 }

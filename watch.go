@@ -171,8 +171,10 @@ func takeSnapshots(paths []string, prev map[string]fileSnapshot) map[string]file
 
 		if prev != nil {
 			if prevSnap, ok := prev[path]; ok && prevSnap.exists && prevSnap.size == size && prevSnap.modTime.Equal(modTime) {
-				snaps[path] = prevSnap
-				continue
+				if time.Since(modTime) >= 500*time.Millisecond {
+					snaps[path] = prevSnap
+					continue
+				}
 			}
 		}
 

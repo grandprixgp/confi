@@ -150,6 +150,10 @@ func (p *Parser) writeBashCompletion(w io.Writer, appName string, safeFunc strin
 }
 
 func (p *Parser) writeZshCompletion(w io.Writer, appName string, safeFunc string, schema *structSchema) error {
+	escapeZsh := func(s string) string {
+		return strings.NewReplacer(":", `\:`, "[", `\[`, "]", `\]`, "'", `\'`).Replace(s)
+	}
+
 	fmt.Fprintf(w, "#compdef %s\n\n", appName)
 	fmt.Fprintf(w, "_%s() {\n", safeFunc)
 	fmt.Fprintf(w, "    local -a opts\n")
@@ -158,16 +162,50 @@ func (p *Parser) writeZshCompletion(w io.Writer, appName string, safeFunc string
 		if meta.isPositional {
 			continue
 		}
-		desc := strings.ReplaceAll(meta.usage, "'", "")
+		desc := escapeZsh(meta.usage)
 		if len(meta.oneOf) > 0 {
 			fmt.Fprintf(w, "        '%s%s[%s]:value:(%s)'\n", p.prefix, meta.flagName, desc, strings.Join(meta.oneOf, " "))
+			if meta.short != "" {
+				fmt.Fprintf(w, "        '-%s[%s]:value:(%s)'\n", meta.short, desc, strings.Join(meta.oneOf, " "))
+			}
 		} else {
 			fmt.Fprintf(w, "        '%s%s[%s]'\n", p.prefix, meta.flagName, desc)
+			if meta.short != "" {
+				fmt.Fprintf(w, "        '-%s[%s]'\n", meta.short, desc)
+			}
 		}
 	}
+	if p.configFlag != "" {
+		fmt.Fprintf(w, "        '%s%s[Path to config file]'\n", p.prefix, p.configFlag)
+	}
+	if p.completionFlag != "" {
+		fmt.Fprintf(w, "        '%s%s[Generate shell completion script]:shell:(bash zsh fish)'\n", p.prefix, p.completionFlag)
+	}
+	fmt.Fprintf(w, "        '--help[Show help and usage information]'\n")
+	fmt.Fprintf(w, "        '-h[Show help and usage information]'\n")
+
 	for _, sub := range schema.subcommandList {
-		desc := strings.ReplaceAll(sub.usage, "'", "")
+		desc := escapeZsh(sub.usage)
 		fmt.Fprintf(w, "        '%s:%s'\n", sub.name, desc)
+		if sub.schema != nil {
+			for _, meta := range sub.schema.fields {
+				if meta.isPositional {
+					continue
+				}
+				sDesc := escapeZsh(meta.usage)
+				if len(meta.oneOf) > 0 {
+					fmt.Fprintf(w, "        '%s%s[%s]:value:(%s)'\n", p.prefix, meta.flagName, sDesc, strings.Join(meta.oneOf, " "))
+					if meta.short != "" {
+						fmt.Fprintf(w, "        '-%s[%s]:value:(%s)'\n", meta.short, sDesc, strings.Join(meta.oneOf, " "))
+					}
+				} else {
+					fmt.Fprintf(w, "        '%s%s[%s]'\n", p.prefix, meta.flagName, sDesc)
+					if meta.short != "" {
+						fmt.Fprintf(w, "        '-%s[%s]'\n", meta.short, sDesc)
+					}
+				}
+			}
+		}
 	}
 	fmt.Fprintf(w, "    )\n")
 	fmt.Fprintf(w, "    _describe '%s' opts\n", appName)

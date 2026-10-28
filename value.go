@@ -80,11 +80,11 @@ func assignFromStrings(fv reflect.Value, raws []string, sep string, appendMode b
 	switch t.Kind() {
 	case reflect.Slice:
 		var items []string
-		elemKind := t.Elem().Kind()
+		_ = t.Elem().Kind()
 		for _, r := range raws {
 			if sep != "" && strings.Contains(r, sep) {
 				// For non-string slices, or single-token comma-lists without spaces, split by sep.
-				if elemKind != reflect.String || !strings.Contains(r, " ") || sep != "," {
+				if true {
 					items = append(items, splitBySeparator(r, sep)...)
 					continue
 				}

@@ -1231,3 +1231,105 @@ func TestPhase3PerformanceAndWatcher(t *testing.T) {
 	}
 	watcher.RUnlock()
 }
+
+func TestPhase4ObservabilityAndErgonomics(t *testing.T) {
+	// 1. Slice comma splitting with whitespace (MAJ-21)
+	type TagsCfg struct {
+		Tags []string `confi:"tags"`
+	}
+	var tagCfg TagsCfg
+	err := Parse(&tagCfg, WithArgs([]string{"--tags", "apple, banana, cherry"}))
+	if err != nil {
+		t.Fatalf("Parse tags failed: %v", err)
+	}
+	if len(tagCfg.Tags) != 3 || tagCfg.Tags[0] != "apple" || tagCfg.Tags[1] != "banana" || tagCfg.Tags[2] != "cherry" {
+		t.Fatalf("MAJ-21 failed: expected 3 split tags, got: %v", tagCfg.Tags)
+	}
+
+	// 2. Zsh completion short flags, subcommands, and escaping (MAJ-22 & MAJ-23)
+	type ServeCmd struct {
+		Port int `confi:"port,short=p,usage='Port [default: 8080]'"`
+	}
+	type RootApp struct {
+		Verbose bool      `confi:"verbose,short=v,usage='Enable verbose [logging: debug]'"`
+		Serve   *ServeCmd `confi:"serve,subcommand,usage='Start background server'"`
+	}
+	var root RootApp
+	var zshBuf bytes.Buffer
+	err = Parse(&root, WithName("testapp"), WithCompletionFlag("completion"), WithOutput(&zshBuf), WithArgs([]string{"--completion", "zsh"}))
+	if err != nil && err != ErrHelp {
+		t.Fatalf("Parse zsh completion failed: %v", err)
+	}
+	zshOut := zshBuf.String()
+	if !strings.Contains(zshOut, `'-v[Enable verbose \[logging\: debug\]]'`) {
+		t.Fatalf("MAJ-22/23 failed: expected escaped usage and short flag for -v, got:\n%s", zshOut)
+	}
+	if !strings.Contains(zshOut, `'serve:Start background server'`) {
+		t.Fatalf("MAJ-22 failed: expected subcommand serve in zsh completion, got:\n%s", zshOut)
+	}
+	if !strings.Contains(zshOut, `'-p[Port \[default\: 8080\]]'`) {
+		t.Fatalf("MAJ-22 failed: expected subcommand short flag -p in zsh completion, got:\n%s", zshOut)
+	}
+
+	// 3. YAML sample generator for sibling structs (MAJ-24)
+	type DBNode struct {
+		Host string `confi:"host,default=localhost"`
+		Port int    `confi:"port,default=5432"`
+	}
+	type DBCluster struct {
+		Primary DBNode `confi:"primary"`
+		Replica DBNode `confi:"replica"`
+	}
+	type ClusterCfg struct {
+		DB DBCluster `confi:"db"`
+	}
+	yamlSample, err := GenerateSample(&ClusterCfg{}, FormatYAML)
+	if err != nil {
+		t.Fatalf("GenerateSample YAML failed: %v", err)
+	}
+	lines := strings.Split(yamlSample, "\n")
+	dbCount := 0
+	for _, l := range lines {
+		if strings.TrimRight(l, "\r") == "db:" {
+			dbCount++
+		}
+	}
+	if dbCount != 1 {
+		t.Fatalf("MAJ-24 failed: expected 'db:' exactly once in YAML sample, got %d times in:\n%s", dbCount, yamlSample)
+	}
+
+	// 4. TOML sample generator array quoting (MAJ-25)
+	type ListCfg struct {
+		Fruits []string `confi:"fruits,default='apple,banana'"`
+	}
+	tomlSample, err := GenerateSample(&ListCfg{}, FormatTOML)
+	if err != nil {
+		t.Fatalf("GenerateSample TOML failed: %v", err)
+	}
+	if !strings.Contains(tomlSample, `fruits = ["apple", "banana"]`) {
+		t.Fatalf("MAJ-25 failed: expected quoted TOML array, got:\n%s", tomlSample)
+	}
+
+	// 5. MustParse custom error output and exitFunc (MAJ-28)
+	var errOutBuf bytes.Buffer
+	var stdoutBuf bytes.Buffer
+	exitCode := -1
+	MustParse(&RootApp{},
+		WithArgs([]string{"--unknown-flag"}),
+		WithStrict(true),
+		WithOutput(&stdoutBuf),
+		WithErrOutput(&errOutBuf),
+		WithExitFunc(func(code int) {
+			exitCode = code
+		}),
+	)
+	if exitCode != 1 {
+		t.Fatalf("MAJ-28 failed: expected exit code 1, got %d", exitCode)
+	}
+	if stdoutBuf.Len() > 0 {
+		t.Fatalf("MAJ-28 failed: stdout was polluted: %q", stdoutBuf.String())
+	}
+	if !strings.Contains(errOutBuf.String(), "unknown flag") {
+		t.Fatalf("MAJ-28 failed: expected error in errOutBuf, got %q", errOutBuf.String())
+	}
+}

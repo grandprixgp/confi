@@ -148,6 +148,24 @@ func WithOutput(w io.Writer) Option {
 	}
 }
 
+// WithErrOutput sets the writer used for printing error messages in MustParse (defaults to os.Stderr).
+func WithErrOutput(w io.Writer) Option {
+	return func(p *Parser) {
+		if w != nil {
+			p.errOutput = w
+		}
+	}
+}
+
+// WithExitFunc overrides the fatal exit function called in MustParse (defaults to os.Exit).
+func WithExitFunc(fn func(int)) Option {
+	return func(p *Parser) {
+		if fn != nil {
+			p.exitFunc = fn
+		}
+	}
+}
+
 // WithHelpFlag enables or disables automatic handling of `-h` and `--help` flags (enabled by default).
 func WithHelpFlag(enabled bool) Option {
 	return func(p *Parser) {

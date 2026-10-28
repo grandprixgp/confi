@@ -145,8 +145,17 @@ func (p *Parser) writeSampleYAML(w io.Writer, schema *structSchema, rootVal refl
 		}
 		indent := ""
 		if prefix != "" && prefix != prevPrefix {
-			for i := 0; i < len(meta.configPath)-1; i++ {
-				fmt.Fprintf(w, "%s%s:\n", strings.Repeat("  ", i), meta.configPath[i])
+			var prevParts []string
+			if prevPrefix != "" {
+				prevParts = strings.Split(prevPrefix, ".")
+			}
+			currParts := meta.configPath[:len(meta.configPath)-1]
+			common := 0
+			for common < len(prevParts) && common < len(currParts) && prevParts[common] == currParts[common] {
+				common++
+			}
+			for i := common; i < len(currParts); i++ {
+				fmt.Fprintf(w, "%s%s:\n", strings.Repeat("  ", i), currParts[i])
 			}
 		}
 		prevPrefix = prefix
@@ -331,6 +340,34 @@ func sampleValueYAML(meta *fieldMeta, rootVal reflect.Value) string {
 }
 
 func sampleValueTOML(meta *fieldMeta, rootVal reflect.Value) string {
+	if meta.secret {
+		return `""`
+	}
+	t := meta.fieldType
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if meta.hasDefault && meta.defaultValue != "" {
+		if t.Kind() == reflect.Slice && !implementsTextUnmarshaler(t) {
+			items := splitBySeparator(meta.defaultValue, meta.sep)
+			elemType := t.Elem()
+			if elemType.Kind() == reflect.Ptr {
+				elemType = elemType.Elem()
+			}
+			if elemType.Kind() == reflect.String || elemType == durationType {
+				quoted := make([]string, len(items))
+				for i, it := range items {
+					quoted[i] = fmt.Sprintf("%q", it)
+				}
+				return "[" + strings.Join(quoted, ", ") + "]"
+			}
+			return "[" + strings.Join(items, ", ") + "]"
+		}
+		if t.Kind() == reflect.String || t == durationType {
+			return fmt.Sprintf("%q", meta.defaultValue)
+		}
+		return meta.defaultValue
+	}
 	return sampleValueYAML(meta, rootVal)
 }
 
