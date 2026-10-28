@@ -14,6 +14,12 @@ func Usage(target interface{}, opts ...Option) (string, error) {
 	return p.Usage(target)
 }
 
+// WriteUsage writes the formatted help/usage message for target to w.
+func WriteUsage(w io.Writer, target interface{}, opts ...Option) error {
+	p := NewParser("", opts...)
+	return p.WriteUsage(w, target)
+}
+
 // Usage returns the formatted help/usage message for target using this Parser's settings.
 func (p *Parser) Usage(target interface{}) (string, error) {
 	var buf bytes.Buffer

@@ -2,8 +2,11 @@ package confi
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -11,6 +14,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1331,5 +1335,215 @@ func TestPhase4ObservabilityAndErgonomics(t *testing.T) {
 	}
 	if !strings.Contains(errOutBuf.String(), "unknown flag") {
 		t.Fatalf("MAJ-28 failed: expected error in errOutBuf, got %q", errOutBuf.String())
+	}
+}
+
+func TestPhase5VerificationAndStress(t *testing.T) {
+	// 1. Concurrent race stress on Watcher (MAJ-30)
+	tmpDir, err := ioutil.TempDir("", "confi_stress_")
+	if err != nil {
+		t.Fatalf("TempDir failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfgPath := filepath.Join(tmpDir, "stress.json")
+	if err := ioutil.WriteFile(cfgPath, []byte(`{"counter": 1}`), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	type StressCfg struct {
+		Counter int `confi:"counter"`
+	}
+	var stressCfg StressCfg
+
+	watcher, err := Watch(&stressCfg, func(err error) {
+		// on reload callback
+	}, WithConfigFile(cfgPath), WithWatchInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+	defer watcher.Close()
+
+	stopStress := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Readers
+	for i := 0; i < 15; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopStress:
+					return
+				default:
+					watcher.RLock()
+					_ = stressCfg.Counter
+					watcher.RUnlock()
+					time.Sleep(1 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	// Writers
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				select {
+				case <-stopStress:
+					return
+				default:
+					_ = ioutil.WriteFile(cfgPath, []byte(fmt.Sprintf(`{"counter": %d}`, j+writerID*100)), 0644)
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	close(stopStress)
+	wg.Wait()
+
+	// 2. Fuzz simulation on zero-dependency parsers (MAJ-29)
+	r := rand.New(rand.NewSource(1337))
+
+	// Fuzz CLI Lexer
+	type FuzzStruct struct {
+		Alpha string   `confi:"alpha,short=a"`
+		Num   int      `confi:"num,short=n"`
+		Flag  bool     `confi:"flag,short=f"`
+		List  []string `confi:"list"`
+	}
+	sampleTokens := []string{
+		"--alpha", "-a", "val", "--num", "-n", "42", "-42", "--flag", "-f", "-fa",
+		"--list", "a,b,c", "", "-", "--", "--unknown", "pos1", "pos2",
+		"=", "--alpha=", "--num=invalid", "\x00", "\n", "\t", "true", "false",
+	}
+	for i := 0; i < 300; i++ {
+		numTokens := r.Intn(8)
+		tokens := make([]string, numTokens)
+		for j := 0; j < numTokens; j++ {
+			tokens[j] = sampleTokens[r.Intn(len(sampleTokens))]
+		}
+		var fTarget FuzzStruct
+		_ = Parse(&fTarget, WithArgs(tokens), WithStrict(false))
+	}
+
+	// Fuzz YAML parser
+	yamlCorpus := [][]byte{
+		[]byte(""),
+		[]byte("\t\ta: 1\n"),
+		[]byte("key: [1, 2, \n"),
+		[]byte("key: {a: 1\n"),
+		[]byte("foo: \"bar\n"),
+		[]byte("deep:\n  nest:\n    val: 1\n"),
+		[]byte("---\nfoo: bar\n---\nbaz: qux\n"),
+		[]byte("list:\n  - a\n  - b\n"),
+	}
+	for i := 0; i < 300; i++ {
+		var payload []byte
+		if r.Intn(2) == 0 {
+			base := yamlCorpus[r.Intn(len(yamlCorpus))]
+			payload = make([]byte, len(base))
+			copy(payload, base)
+			if len(payload) > 0 {
+				payload[r.Intn(len(payload))] = byte(r.Intn(256))
+			}
+		} else {
+			payload = make([]byte, r.Intn(64))
+			r.Read(payload)
+		}
+		_, _ = parseYAML(bytes.NewReader(payload))
+	}
+
+	// Fuzz TOML parser
+	tomlCorpus := [][]byte{
+		[]byte(""),
+		[]byte("a = 1\n"),
+		[]byte("[section]\nb = \"str\"\n"),
+		[]byte("[[arr]]\nname = 1\n"),
+		[]byte("unclosed = [1, 2\n"),
+		[]byte("unclosed_str = \"no end\n"),
+		[]byte("hash = # comment\n1\n"),
+	}
+	for i := 0; i < 300; i++ {
+		var payload []byte
+		if r.Intn(2) == 0 {
+			base := tomlCorpus[r.Intn(len(tomlCorpus))]
+			payload = make([]byte, len(base))
+			copy(payload, base)
+			if len(payload) > 0 {
+				payload[r.Intn(len(payload))] = byte(r.Intn(256))
+			}
+		} else {
+			payload = make([]byte, r.Intn(64))
+			r.Read(payload)
+		}
+		_, _ = parseTOML(bytes.NewReader(payload))
+	}
+
+	// Fuzz .env parser
+	dotEnvCorpus := [][]byte{
+		[]byte(""),
+		[]byte("A=B\n"),
+		[]byte("FOO=\"bar\n"),
+		[]byte("REF=$VAR_${NOT_EXIST:-def}\n"),
+		[]byte("EXPORT FOO=BAR\n"),
+		[]byte("MULTI=\"line1\nline2\"\n"),
+	}
+	for i := 0; i < 300; i++ {
+		var payload []byte
+		if r.Intn(2) == 0 {
+			base := dotEnvCorpus[r.Intn(len(dotEnvCorpus))]
+			payload = make([]byte, len(base))
+			copy(payload, base)
+			if len(payload) > 0 {
+				payload[r.Intn(len(payload))] = byte(r.Intn(256))
+			}
+		} else {
+			payload = make([]byte, r.Intn(64))
+			r.Read(payload)
+		}
+		_, _ = parseDotEnv(bytes.NewReader(payload), os.LookupEnv)
+	}
+
+	// 3. Zero-coverage APIs and error paths
+	var buf bytes.Buffer
+	if err := WriteCompletion(&buf, "bash", &FuzzStruct{}); err != nil {
+		t.Fatalf("WriteCompletion failed: %v", err)
+	}
+	buf.Reset()
+	if err := WriteUsage(&buf, &FuzzStruct{}); err != nil {
+		t.Fatalf("WriteUsage failed: %v", err)
+	}
+
+	innerErr := errors.New("underlying cause")
+	parseErr := &ParseError{Field: "foo", Message: "failed", Err: innerErr}
+	if parseErr.Unwrap() != innerErr {
+		t.Fatalf("ParseError.Unwrap mismatch: got %v", parseErr.Unwrap())
+	}
+
+	valErr := &ValidationError{MissingFields: []string{"Host", "Port"}}
+	if !strings.Contains(valErr.Error(), "Host, Port") {
+		t.Fatalf("ValidationError.Error mismatch: got %s", valErr.Error())
+	}
+
+	os.Setenv("CONFI_TEST_USER_99", "admin99")
+	defer os.Unsetenv("CONFI_TEST_USER_99")
+	envMap, err := parseDotEnv(strings.NewReader("GREETING=hello $CONFI_TEST_USER_99!\n"), os.LookupEnv)
+	if err != nil || envMap["GREETING"] != "hello admin99!" {
+		t.Fatalf("DotEnv $VAR expansion failed: %v, got %q", err, envMap["GREETING"])
+	}
+
+	type MapFieldCfg struct {
+		Metadata map[string]string `confi:"metadata"`
+	}
+	var mapCfg MapFieldCfg
+	err = Parse(&mapCfg, WithConfigReader(strings.NewReader(`{"metadata": {"key1": "val1", "key2": "val2"}}`), FormatJSON), WithStrict(true), WithArgs(nil))
+	if err != nil || mapCfg.Metadata["key1"] != "val1" {
+		t.Fatalf("Parse map field failed in strict mode: %v", err)
 	}
 }
