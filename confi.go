@@ -40,6 +40,11 @@ func (e *ParseError) Error() string {
 	return fmt.Sprintf("confi: %s", e.Message)
 }
 
+// Unwrap returns the underlying error.
+func (e *ParseError) Unwrap() error {
+	return e.Err
+}
+
 // ValidationError is returned when one or more required fields are missing after parsing all sources.
 type ValidationError struct {
 	MissingFields []string
@@ -172,10 +177,21 @@ func (p *Parser) RunCommand(target interface{}) error {
 				if r, ok := extractRunner(subVal); ok {
 					return r.Run()
 				}
+				return fmt.Errorf("confi: subcommand %q does not implement Runner", p.activeCommand)
+			}
+			return nil
+		}
+		return nil
+	}
+	/*
+				if r, ok := extractRunner(subVal); ok {
+					return r.Run()
+				}
 			}
 		}
 	}
 
+	*/
 	if r, ok := extractRunner(rootVal); ok {
 		return r.Run()
 	}
@@ -260,7 +276,7 @@ func (p *Parser) parseIntoSchema(schema *structSchema, rootVal reflect.Value, ar
 			})
 		}
 
-		if schema.configFileField != nil {
+		if schema.configFileField != nil && cliRes.configFilePath == "" {
 			if dynPath := p.resolveConfigFieldPath(schema.configFileField, rootVal, cliRes); dynPath != "" {
 				allSources = append(allSources, configSource{
 					path:   dynPath,

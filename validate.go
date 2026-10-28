@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 )
 
 // Validator can be implemented by a configuration struct (or any nested struct/field)
@@ -95,9 +96,15 @@ func validateFieldConstraints(meta *fieldMeta, fv reflect.Value) error {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			num := float64(fv.Int())
 			if meta.hasMin && num < meta.minVal {
+				if fv.Type() == durationType {
+					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("duration %v is less than minimum %v", time.Duration(fv.Int()), time.Duration(meta.minVal))}
+				}
 				return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v is less than minimum %v", fv.Int(), meta.minVal)}
 			}
 			if meta.hasMax && num > meta.maxVal {
+				if fv.Type() == durationType {
+					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("duration %v exceeds maximum %v", time.Duration(fv.Int()), time.Duration(meta.maxVal))}
+				}
 				return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v exceeds maximum %v", fv.Int(), meta.maxVal)}
 			}
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:

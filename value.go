@@ -32,7 +32,7 @@ func assignFromString(fv reflect.Value, raw string, sep string, appendMode bool)
 	if implementsTextUnmarshaler(t) {
 		return assignScalar(fv, raw)
 	}
-	if t.Kind() == reflect.Ptr && t.Elem().Kind() == reflect.Slice && !implementsTextUnmarshaler(t.Elem()) {
+	if t.Kind() == reflect.Ptr && (t.Elem().Kind() == reflect.Slice || t.Elem().Kind() == reflect.Map) && !implementsTextUnmarshaler(t.Elem()) {
 		if fv.IsNil() {
 			fv.Set(reflect.New(t.Elem()))
 		}

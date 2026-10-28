@@ -563,7 +563,15 @@ func buildFieldMeta(sf reflect.StructField, indexPath []int, namePrefix []string
 	var hasMin bool
 	var minVal float64
 	if minStr != "" {
-		v, err := strconv.ParseFloat(minStr, 64)
+		var v float64
+		var err error
+		if sf.Type == durationType {
+			var d time.Duration
+			d, err = time.ParseDuration(minStr)
+			v = float64(d)
+		} else {
+			v, err = strconv.ParseFloat(minStr, 64)
+		}
 		if err != nil {
 			return nil, &ParseError{Field: fullFieldName, Message: fmt.Sprintf("invalid min tag value %q: %v", minStr, err)}
 		}
@@ -578,7 +586,15 @@ func buildFieldMeta(sf reflect.StructField, indexPath []int, namePrefix []string
 	var hasMax bool
 	var maxVal float64
 	if maxStr != "" {
-		v, err := strconv.ParseFloat(maxStr, 64)
+		var v float64
+		var err error
+		if sf.Type == durationType {
+			var d time.Duration
+			d, err = time.ParseDuration(maxStr)
+			v = float64(d)
+		} else {
+			v, err = strconv.ParseFloat(maxStr, 64)
+		}
 		if err != nil {
 			return nil, &ParseError{Field: fullFieldName, Message: fmt.Sprintf("invalid max tag value %q: %v", maxStr, err)}
 		}

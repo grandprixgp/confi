@@ -1003,3 +1003,130 @@ func TestP0Fixes(t *testing.T) {
 		t.Fatalf("CRIT-05 failed: unexpected parsed zero values: %+v", reqZero)
 	}
 }
+
+
+func TestP1Fixes(t *testing.T) {
+	// 1. Negative positional number (MAJ-01)
+	type Calc struct {
+		Offset int `confi:"offset,pos"`
+	}
+	var c Calc
+	err := Parse(&c, WithArgs([]string{"-10"}), WithStrict(true))
+	if err != nil || c.Offset != -10 {
+		t.Fatalf("MAJ-01 failed: negative positional parse failed: offset=%d, err=%v", c.Offset, err)
+	}
+
+	// 2. Empty inline flag (MAJ-02)
+	type InlineCfg struct {
+		Prefix string `confi:"prefix"`
+		File   string `confi:"file,pos"`
+	}
+	var inlineCfg InlineCfg
+	err = Parse(&inlineCfg, WithArgs([]string{"--prefix=", "data.csv"}))
+	if err != nil || inlineCfg.Prefix != "" || inlineCfg.File != "data.csv" {
+		t.Fatalf("MAJ-02 failed: expected prefix='', file='data.csv', got prefix=%q, file=%q, err=%v", inlineCfg.Prefix, inlineCfg.File, err)
+	}
+
+	// 3. Pointer map default & env (MAJ-03)
+	type PtrMapCfg struct {
+		Tags *map[string]string `confi:"tags,default='env=prod'"`
+	}
+	var ptrMap PtrMapCfg
+	err = Parse(&ptrMap, WithArgs(nil))
+	if err != nil || ptrMap.Tags == nil || (*ptrMap.Tags)["env"] != "prod" {
+		t.Fatalf("MAJ-03 failed: pointer map default failed: tags=%v, err=%v", ptrMap.Tags, err)
+	}
+
+	// 4. Subcommand runner does not fall through to root (MAJ-04)
+	type RootCmd struct {
+		Sub struct{} `confi:"sub,subcommand"`
+	}
+	var rootCmd RootCmd
+	err = Parse(&rootCmd, WithArgs([]string{"sub"}), WithAutoRun(true))
+	if err == nil || !strings.Contains(err.Error(), "does not implement Runner") {
+		t.Fatalf("MAJ-04 failed: expected error that subcommand does not implement Runner, got: %v", err)
+	}
+
+	// 5. CLI --config precedence over struct default config (MAJ-05)
+	tmpDir, err := ioutil.TempDir("", "confi_maj5_")
+	if err != nil {
+		t.Fatalf("TempDir failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	defaultPath := filepath.Join(tmpDir, "default.yaml")
+	overridePath := filepath.Join(tmpDir, "override.yaml")
+	ioutil.WriteFile(defaultPath, []byte("host: default.local\n"), 0600)
+	ioutil.WriteFile(overridePath, []byte("host: override.local\n"), 0600)
+
+	type CfgPrecedence struct {
+		ConfigFile string `confi:"config,config,default="`
+		Host       string `confi:"host"`
+	}
+	var cfgPrec CfgPrecedence
+	cfgPrec.ConfigFile = defaultPath
+	err = Parse(&cfgPrec, WithConfigFlag("config"), WithArgs([]string{"--config", overridePath}))
+	if err != nil || cfgPrec.Host != "override.local" {
+		t.Fatalf("MAJ-05 failed: expected Host='override.local', got %q, err=%v", cfgPrec.Host, err)
+	}
+
+	// 6. TOML array of tables and unterminated array (MAJ-06..10)
+	type ServerEntry struct {
+		Host string `toml:"host"`
+		Port int    `toml:"port"`
+	}
+	type TOMLArrayCfg struct {
+		Servers []ServerEntry `confi:"servers"`
+	}
+	tomlData := `
+[[servers]]
+host = "srv1.local"
+port = 8001
+
+[[servers]]
+host = "srv2.local"
+port = 8002
+`
+	var tomlArr CfgPrecedence
+	_ = tomlArr
+	var tomlCfg TOMLArrayCfg
+	err = Parse(&tomlCfg, WithConfigReader(strings.NewReader(tomlData), FormatTOML), WithArgs(nil))
+	if err != nil || len(tomlCfg.Servers) != 2 || tomlCfg.Servers[0].Host != "srv1.local" || tomlCfg.Servers[1].Host != "srv2.local" {
+		t.Fatalf("MAJ-09 failed: expected 2 servers in table array, got: %+v, err=%v", tomlCfg.Servers, err)
+	}
+
+	// Test unterminated TOML array returns error
+	type BadTOML struct {
+		Ports []int `confi:"ports"`
+	}
+	var badTOML BadTOML
+	err = Parse(&badTOML, WithConfigReader(strings.NewReader("ports = [ 80, 81\n"), FormatTOML), WithArgs(nil))
+	if err == nil || !strings.Contains(err.Error(), "unterminated multiline array") {
+		t.Fatalf("MAJ-07 failed: expected error on unterminated TOML array, got: %v", err)
+	}
+
+	// 7. Multiline .env support (MAJ-11)
+	type MultiDotEnv struct {
+		Cert string `confi:"cert"`
+	}
+	var mDot MultiDotEnv
+	dotEnvData := "CERT=\"line1\nline2\nline3\"\n"
+	err = Parse(&mDot, WithConfigReader(strings.NewReader(dotEnvData), FormatEnv), WithArgs(nil))
+	if err != nil || mDot.Cert != "line1\nline2\nline3" {
+		t.Fatalf("MAJ-11 failed: expected multiline cert, got %q, err=%v", mDot.Cert, err)
+	}
+
+	// 8. Duration min/max validation (MAJ-20)
+	type DurCfg struct {
+		Timeout time.Duration `confi:"timeout,min=100ms,max=5s,default=1s"`
+	}
+	var dur DurCfg
+	err = Parse(&dur, WithArgs([]string{"--timeout=50ms"}))
+	if err == nil || !strings.Contains(err.Error(), "less than minimum") {
+		t.Fatalf("MAJ-20 failed: expected min duration error for 50ms, got: %v", err)
+	}
+	err = Parse(&dur, WithArgs([]string{"--timeout=10s"}))
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("MAJ-20 failed: expected max duration error for 10s, got: %v", err)
+	}
+}

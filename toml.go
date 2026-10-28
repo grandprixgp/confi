@@ -28,11 +28,20 @@ func parseTOML(r io.Reader) (map[string]interface{}, error) {
 			continue
 		}
 
+		// Array of tables: [[table]] or [[table.sub]]
+		if strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]") {
+			secName := strings.TrimSpace(line[2 : len(line)-2])
+			if secName == "" {
+				return nil, fmt.Errorf("toml line %d: empty table array header", lineNum)
+			}
+			parts := strings.Split(secName, ".")
+			currentSection = appendTableArrayEntry(root, parts)
+			continue
+		}
+
 		// Section header: [section] or [section.sub]
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			secName := strings.TrimSpace(line[1 : len(line)-1])
-			secName = strings.TrimPrefix(secName, "[")
-			secName = strings.TrimSuffix(secName, "]")
 			if secName == "" {
 				return nil, fmt.Errorf("toml line %d: empty section header", lineNum)
 			}
@@ -89,6 +98,9 @@ func parseTOML(r io.Reader) (map[string]interface{}, error) {
 					acc.WriteString(" ")
 					acc.WriteString(nextPart)
 				}
+			}
+			if !isBalancedBrackets(acc.String()) {
+				return nil, fmt.Errorf("toml line %d: unterminated multiline array", lineNum)
 			}
 			rawVal = acc.String()
 		}
@@ -162,10 +174,13 @@ func isBalancedBrackets(s string) bool {
 				depth++
 			} else if ch == ']' {
 				depth--
+				if depth < 0 {
+					return false
+				}
 			}
 		}
 	}
-	return depth <= 0
+	return depth == 0
 }
 
 func ensureNestedTOMLMap(root map[string]interface{}, parts []string) map[string]interface{} {
@@ -186,6 +201,36 @@ func ensureNestedTOMLMap(root map[string]interface{}, parts []string) map[string
 		curr = sub
 	}
 	return curr
+}
+
+func appendTableArrayEntry(root map[string]interface{}, parts []string) map[string]interface{} {
+	curr := root
+	for i := 0; i < len(parts)-1; i++ {
+		part := unquoteYAMLScalar(strings.TrimSpace(parts[i]))
+		if part == "" {
+			continue
+		}
+		if existing, ok := curr[part]; ok {
+			if sub, ok := existing.(map[string]interface{}); ok {
+				curr = sub
+				continue
+			}
+		}
+		sub := make(map[string]interface{})
+		curr[part] = sub
+		curr = sub
+	}
+
+	leaf := unquoteYAMLScalar(strings.TrimSpace(parts[len(parts)-1]))
+	newEntry := make(map[string]interface{})
+	if existing, ok := curr[leaf]; ok {
+		if arr, ok := existing.([]interface{}); ok {
+			curr[leaf] = append(arr, newEntry)
+			return newEntry
+		}
+	}
+	curr[leaf] = []interface{}{newEntry}
+	return newEntry
 }
 
 func setTOMLKey(section map[string]interface{}, rawKey string, val interface{}) {

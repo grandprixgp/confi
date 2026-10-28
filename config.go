@@ -393,6 +393,9 @@ func assignInterfaceValue(fv reflect.Value, val interface{}, sep string) error {
 		return nil
 
 	case map[string]interface{}:
+		if t.Kind() == reflect.Struct {
+			return assignStructFromMap(fv, v, sep)
+		}
 		if t.Kind() != reflect.Map {
 			return fmt.Errorf("cannot assign object/map to %s", t.String())
 		}
@@ -420,6 +423,73 @@ func assignInterfaceValue(fv reflect.Value, val interface{}, sep string) error {
 		}
 		return assignFromString(fv, strVal, sep, false)
 	}
+}
+
+func assignStructFromMap(fv reflect.Value, m map[string]interface{}, sep string) error {
+	t := fv.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath != "" && !sf.Anonymous {
+			continue
+		}
+		fieldVal := fv.Field(i)
+		if !fieldVal.CanSet() {
+			continue
+		}
+
+		var candidates []string
+		for _, tagKey := range []string{"confi", "toml", "yaml", "json"} {
+			if tagVal := sf.Tag.Get(tagKey); tagVal != "" && tagVal != "-" {
+				parts := strings.Split(tagVal, ",")
+				name := strings.TrimSpace(parts[0])
+				if name != "" && name != "-" {
+					candidates = append(candidates, name)
+				}
+			}
+		}
+		candidates = append(candidates, sf.Name)
+		candidates = append(candidates, toKebabCase(sf.Name))
+		candidates = append(candidates, toSnakeCase(sf.Name))
+
+		if sf.Anonymous {
+			matchedExplicit := false
+			for _, cand := range candidates {
+				if v, _, ok := findKeyInMap(m, cand); ok {
+					matchedExplicit = true
+					if err := assignInterfaceValue(fieldVal, v, sep); err != nil {
+						return fmt.Errorf("field %s: %v", sf.Name, err)
+					}
+					break
+				}
+			}
+			if matchedExplicit {
+				continue
+			}
+			if sf.Type.Kind() == reflect.Struct {
+				if err := assignStructFromMap(fieldVal, m, sep); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		var foundVal interface{}
+		var found bool
+		for _, cand := range candidates {
+			if v, _, ok := findKeyInMap(m, cand); ok {
+				foundVal = v
+				found = true
+				break
+			}
+		}
+
+		if found {
+			if err := assignInterfaceValue(fieldVal, foundVal, sep); err != nil {
+				return fmt.Errorf("field %s: %v", sf.Name, err)
+			}
+		}
+	}
+	return nil
 }
 
 func scalarInterfaceToString(val interface{}) (string, error) {

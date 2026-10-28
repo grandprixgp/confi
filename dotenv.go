@@ -41,6 +41,19 @@ func parseDotEnv(r io.Reader, lookupEnv func(string) (string, bool)) (map[string
 		}
 
 		rawVal := strings.TrimSpace(line[eqIdx+1:])
+
+		// If rawVal begins with an opening quote and is unclosed on the current line,
+		// continue reading subsequent lines until the closing quote is encountered.
+		if isUnclosedDotEnvQuote(rawVal) {
+			for scanner.Scan() {
+				lineNum++
+				rawVal += "\n" + scanner.Text()
+				if !isUnclosedDotEnvQuote(rawVal) {
+					break
+				}
+			}
+		}
+
 		val, err := parseDotEnvValue(rawVal, result, lookupEnv)
 		if err != nil {
 			return nil, fmt.Errorf(".env line %d: %v", lineNum, err)
@@ -52,6 +65,31 @@ func parseDotEnv(r io.Reader, lookupEnv func(string) (string, bool)) (map[string
 		return nil, err
 	}
 	return result, nil
+}
+
+func isUnclosedDotEnvQuote(s string) bool {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "'") {
+		return strings.IndexByte(s[1:], '\'') < 0
+	}
+	if strings.HasPrefix(s, "\"") {
+		escaped := false
+		for i := 1; i < len(s); i++ {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if s[i] == '\\' {
+				escaped = true
+				continue
+			}
+			if s[i] == '"' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func parseDotEnvValue(raw string, current map[string]string, lookupEnv func(string) (string, bool)) (string, error) {

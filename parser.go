@@ -63,6 +63,12 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 			continue
 		}
 
+		// If no flag is active and arg looks like a negative number (e.g. "-10"), treat it as a positional argument.
+		if currentFlag == nil && looksLikeNegativeNumber(arg) {
+			res.positional = append(res.positional, arg)
+			continue
+		}
+
 		// Check long prefix (default "--")
 		if prefix != "" && strings.HasPrefix(arg, prefix) && len(arg) > len(prefix) {
 			flushCurrent()
@@ -199,7 +205,7 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 				name: rawName,
 			}
 			if hasInlineVal {
-				if inlineVal != "" {
+				if inlineVal != "" || !isMultiValueField(meta) {
 					currentFlag.values = append(currentFlag.values, inlineVal)
 					if !isMultiValueField(meta) {
 						flushCurrent()
@@ -256,7 +262,7 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 					name: rawShort,
 				}
 				if hasInlineVal {
-					if inlineVal != "" {
+					if inlineVal != "" || !isMultiValueField(meta) {
 						currentFlag.values = append(currentFlag.values, inlineVal)
 						if !isMultiValueField(meta) {
 							flushCurrent()
@@ -272,12 +278,13 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 
 			// Check bundled single-character short flags, e.g. "-abc"
 			if len(rawShort) > 1 && isBundledShorts(rawShort, schema) {
-				for idx := 0; idx < len(rawShort); idx++ {
-					ch := string(rawShort[idx])
+				runes := []rune(rawShort)
+				for idx := 0; idx < len(runes); idx++ {
+					ch := string(runes[idx])
 					meta := schema.byShort[ch]
 					if meta.isBoolean() {
 						val := "true"
-						if idx == len(rawShort)-1 && hasInlineVal && inlineVal != "" {
+						if idx == len(runes)-1 && hasInlineVal && inlineVal != "" {
 							val = inlineVal
 						}
 						res.flags = append(res.flags, parsedFlag{
@@ -290,10 +297,14 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 							meta: meta,
 							name: ch,
 						}
-						if hasInlineVal && inlineVal != "" {
-							currentFlag.values = append(currentFlag.values, inlineVal)
-							if !isMultiValueField(meta) {
-								flushCurrent()
+						if hasInlineVal {
+							if inlineVal != "" || !isMultiValueField(meta) {
+								currentFlag.values = append(currentFlag.values, inlineVal)
+								if !isMultiValueField(meta) {
+									flushCurrent()
+								}
+							} else {
+								expectingValue = true
 							}
 						} else {
 							expectingValue = true
@@ -392,13 +403,14 @@ func looksLikeNegativeNumber(s string) bool {
 }
 
 func isBundledShorts(rawShort string, schema *structSchema) bool {
-	for i := 0; i < len(rawShort); i++ {
-		ch := string(rawShort[i])
+	runes := []rune(rawShort)
+	for i := 0; i < len(runes); i++ {
+		ch := string(runes[i])
 		meta, exists := schema.byShort[ch]
 		if !exists {
 			return false
 		}
-		if i < len(rawShort)-1 && !meta.isBoolean() {
+		if i < len(runes)-1 && !meta.isBoolean() {
 			return false
 		}
 	}
