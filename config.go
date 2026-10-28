@@ -193,14 +193,11 @@ func (p *Parser) applyStructuredMap(rawMap map[string]interface{}, schema *struc
 		return nil
 	}
 
-	consumedTopKeys := make(map[string]bool)
-
 	for _, meta := range schema.fields {
-		val, topKey, found := lookupFieldInStructuredMap(rawMap, meta)
+		val, _, found := lookupFieldInStructuredMap(rawMap, meta)
 		if !found || val == nil {
 			continue
 		}
-		consumedTopKeys[topKey] = true
 
 		fv, _ := meta.fieldValue(rootVal, true)
 		if err := assignInterfaceValue(fv, val, meta.sep); err != nil {
@@ -210,13 +207,95 @@ func (p *Parser) applyStructuredMap(rawMap map[string]interface{}, schema *struc
 	}
 
 	if p.strict {
-		for k := range rawMap {
-			if !consumedTopKeys[k] {
-				return &ParseError{Field: k, Message: fmt.Sprintf("unknown config key %q", k)}
-			}
+		if err := validateStrictStructuredMap(rawMap, nil, schema); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func isMapField(m *fieldMeta) bool {
+	if m == nil {
+		return false
+	}
+	t := m.fieldType
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Map
+}
+
+func validateStrictStructuredMap(curr map[string]interface{}, pathPrefix []string, schema *structSchema) error {
+	for k, val := range curr {
+		fullPath := append(append([]string(nil), pathPrefix...), k)
+		fullPathStr := strings.Join(fullPath, ".")
+
+		matchedLeaf := false
+		isMap := false
+		for _, meta := range schema.fields {
+			if len(pathPrefix) == 0 {
+				for _, alias := range meta.aliases {
+					if strings.EqualFold(alias, k) || normalizeKey(alias) == normalizeKey(k) {
+						matchedLeaf = true
+						isMap = isMapField(meta)
+						break
+					}
+				}
+			}
+			if !matchedLeaf && slicesMatchKey(meta.configPath, fullPath) {
+				matchedLeaf = true
+				isMap = isMapField(meta)
+				break
+			}
+			if matchedLeaf {
+				break
+			}
+		}
+
+		if matchedLeaf {
+			if isMap {
+				continue
+			}
+			if subMap, ok := val.(map[string]interface{}); ok {
+				if err := validateStrictStructuredMap(subMap, fullPath, schema); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		isPrefix := false
+		for _, meta := range schema.fields {
+			if len(meta.configPath) > len(fullPath) && slicesMatchKey(meta.configPath[:len(fullPath)], fullPath) {
+				isPrefix = true
+				break
+			}
+		}
+
+		if isPrefix {
+			if subMap, ok := val.(map[string]interface{}); ok {
+				if err := validateStrictStructuredMap(subMap, fullPath, schema); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		return &ParseError{Field: fullPathStr, Message: fmt.Sprintf("unknown config key %q", fullPathStr)}
+	}
+	return nil
+}
+
+func slicesMatchKey(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i], b[i]) && normalizeKey(a[i]) != normalizeKey(b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func lookupFieldInStructuredMap(rawMap map[string]interface{}, meta *fieldMeta) (interface{}, string, bool) {

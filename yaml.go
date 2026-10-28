@@ -32,7 +32,8 @@ func parseYAML(r io.Reader) (map[string]interface{}, error) {
 			continue
 		}
 		indent := countIndent(raw)
-		content := stripYAMLComment(raw[indent:])
+		leadBytes := leadWhitespaceBytes(raw)
+		content := stripYAMLComment(raw[leadBytes:])
 		content = strings.TrimSpace(content)
 		if content == "" {
 			continue
@@ -54,6 +55,31 @@ func parseYAML(r io.Reader) (map[string]interface{}, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+func leadWhitespaceBytes(s string) int {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return i
+}
+
+func cutIndent(s string, indentCols int) string {
+	cols := 0
+	i := 0
+	for i < len(s) && cols < indentCols {
+		if s[i] == ' ' {
+			cols++
+			i++
+		} else if s[i] == '\t' {
+			cols += 2
+			i++
+		} else {
+			break
+		}
+	}
+	return s[i:]
 }
 
 func countIndent(s string) int {
@@ -283,7 +309,7 @@ func readYAMLBlockScalar(lines []yamlLine, currentIdx int, startLineNum int, key
 		if ind < cut {
 			cut = ind
 		}
-		collected = append(collected, raw[cut:])
+		collected = append(collected, cutIndent(raw, cut))
 	}
 
 	// Trim trailing empty lines

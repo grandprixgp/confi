@@ -94,13 +94,19 @@ func buildSchemaForType(t reflect.Type) (*structSchema, error) {
 		byShort:     make(map[string]*fieldMeta),
 		subcommands: make(map[string]*subcommandMeta),
 	}
-	if err := walkStructType(t, nil, nil, nil, schema); err != nil {
+	visited := make(map[reflect.Type]bool)
+	if err := walkStructType(t, nil, nil, nil, schema, visited); err != nil {
 		return nil, err
 	}
 	return schema, nil
 }
 
-func walkStructType(t reflect.Type, indexPrefix []int, namePrefix []string, envPrefix []string, schema *structSchema) error {
+func walkStructType(t reflect.Type, indexPrefix []int, namePrefix []string, envPrefix []string, schema *structSchema, visited map[reflect.Type]bool) error {
+	if visited[t] {
+		return nil
+	}
+	visited[t] = true
+	defer delete(visited, t)
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		// Skip unexported fields
@@ -211,7 +217,7 @@ func walkStructType(t reflect.Type, indexPrefix []int, namePrefix []string, envP
 				nextNamePrefix = append(append([]string(nil), namePrefix...), segName)
 				nextEnvPrefix = append(append([]string(nil), envPrefix...), envSeg)
 			}
-			if err := walkStructType(derefType, indexPath, nextNamePrefix, nextEnvPrefix, schema); err != nil {
+			if err := walkStructType(derefType, indexPath, nextNamePrefix, nextEnvPrefix, schema, visited); err != nil {
 				return err
 			}
 			continue

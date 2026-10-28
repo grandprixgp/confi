@@ -921,3 +921,85 @@ func TestLiveConfigWatcher(t *testing.T) {
 }
 
 
+
+
+func TestP0Fixes(t *testing.T) {
+	// 1. YAML tab indentation panic (CRIT-01)
+	type TabCfg struct {
+		Host string `confi:"host"`
+	}
+	var tabCfg TabCfg
+	err := Parse(&tabCfg, WithConfigReader(strings.NewReader("\t\thost: localhost\n"), FormatYAML), WithArgs(nil))
+	if err != nil || tabCfg.Host != "localhost" {
+		t.Fatalf("CRIT-01 failed: expected host=localhost from tab-indented YAML, got %q, err=%v", tabCfg.Host, err)
+	}
+
+	// 2. Strict mode nested map key bypass (CRIT-02)
+	type DBConfig struct {
+		Host string `confi:"host"`
+	}
+	type StrictCfg struct {
+		DB DBConfig `confi:"db"`
+	}
+	var strictCfg StrictCfg
+	yamlWithUnknownNested := "db:\n  host: localhost\n  unrecognized_setting: 1234\n"
+	err = Parse(&strictCfg, WithConfigReader(strings.NewReader(yamlWithUnknownNested), FormatYAML), WithStrict(true), WithArgs(nil))
+	if err == nil || !strings.Contains(err.Error(), "unknown config key") {
+		t.Fatalf("CRIT-02 failed: expected unknown config key error in strict mode for nested key, got: %v", err)
+	}
+
+	// 3. Cyclic struct stack overflow guard (CRIT-03)
+	type Node struct {
+		Name string `confi:"name"`
+		Next *Node  `confi:"next"`
+	}
+	var node Node
+	err = Parse(&node, WithArgs([]string{"--name", "root"}))
+	if err != nil || node.Name != "root" {
+		t.Fatalf("CRIT-03 failed: cyclic struct parsing failed: %v", err)
+	}
+
+	// 4. Watcher self-deadlock in onChange (CRIT-04)
+	tmpFile, err := ioutil.TempFile("", "watch_crit_")
+	if err != nil {
+		t.Fatalf("TempFile failed: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.WriteString("port: 8080\n")
+	tmpFile.Close()
+
+	type PortCfg struct {
+		Port int `confi:"port"`
+	}
+	var portCfg PortCfg
+	var w *Watcher
+	stopped := make(chan struct{})
+	w, err = Watch(&portCfg, func(reloadErr error) {
+		w.Stop() // Must not deadlock
+		close(stopped)
+	}, WithConfigFile(tmpFile.Name()), WithWatchInterval(10*time.Millisecond), WithArgs(nil))
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+	ioutil.WriteFile(tmpFile.Name(), []byte("port: 9090\n"), 0600)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("CRIT-04 failed: Watcher deadlocked when Stop() called inside onChange")
+	}
+
+	// 5. Explicit zero values on required fields (CRIT-05)
+	type ReqZero struct {
+		Port    int     `confi:"port,required"`
+		Rate    float64 `confi:"rate,required"`
+		Verbose bool    `confi:"verbose,required"`
+	}
+	var reqZero ReqZero
+	err = Parse(&reqZero, WithArgs([]string{"--port", "0", "--rate", "0.0", "--verbose=false"}))
+	if err != nil {
+		t.Fatalf("CRIT-05 failed: explicit zero values rejected on required fields: %v", err)
+	}
+	if reqZero.Port != 0 || reqZero.Rate != 0.0 || reqZero.Verbose {
+		t.Fatalf("CRIT-05 failed: unexpected parsed zero values: %+v", reqZero)
+	}
+}

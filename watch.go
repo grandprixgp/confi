@@ -116,7 +116,7 @@ func (w *Watcher) loop(paths []string, snapshots map[string]fileSnapshot) {
 				w.mu.Unlock()
 			}
 			if w.onChange != nil {
-				w.onChange(err)
+				go w.onChange(err)
 			}
 		}
 	}

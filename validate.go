@@ -31,11 +31,11 @@ func validateSchemaFields(schema *structSchema, rootVal reflect.Value, sources m
 		isSet := sources[meta] != sourceNone
 		isZero := !ok || isZeroValue(fv)
 
-		if meta.required && isZero {
-			if !(meta.isBoolean() && isSet) {
-				missing = append(missing, meta.flagName)
-				continue
-			}
+		// A required field is missing if it was not explicitly set and remains zero-valued.
+		// If it was explicitly set (e.g. --port 0, --rate 0.0, --verbose=false), it is valid.
+		if meta.required && !isSet && isZero {
+			missing = append(missing, meta.flagName)
+			continue
 		}
 
 		// Skip constraint checks on unset zero-valued optional fields
@@ -171,6 +171,11 @@ func matchesOneOf(val string, choices []string) bool {
 }
 
 func invokeCustomValidators(v reflect.Value) error {
+	visited := make(map[uintptr]bool)
+	return invokeCustomValidatorsHelper(v, visited)
+}
+
+func invokeCustomValidatorsHelper(v reflect.Value, visited map[uintptr]bool) error {
 	if !v.IsValid() {
 		return nil
 	}
@@ -178,6 +183,11 @@ func invokeCustomValidators(v reflect.Value) error {
 		if v.IsNil() {
 			return nil
 		}
+		ptr := v.Pointer()
+		if visited[ptr] {
+			return nil
+		}
+		visited[ptr] = true
 		v = v.Elem()
 	}
 
@@ -190,10 +200,8 @@ func invokeCustomValidators(v reflect.Value) error {
 				continue
 			}
 			fv := v.Field(i)
-			if fv.Kind() == reflect.Struct || (fv.Kind() == reflect.Ptr && !fv.IsNil() && fv.Elem().Kind() == reflect.Struct) {
-				if err := invokeCustomValidators(fv); err != nil {
-					return err
-				}
+			if err := invokeCustomValidatorsHelper(fv, visited); err != nil {
+				return err
 			}
 		}
 	}
