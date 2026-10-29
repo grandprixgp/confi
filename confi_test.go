@@ -1547,3 +1547,1917 @@ func TestPhase5VerificationAndStress(t *testing.T) {
 		t.Fatalf("Parse map field failed in strict mode: %v", err)
 	}
 }
+
+func TestReviewBugFixes(t *testing.T) {
+	// 1. Watcher captures pre-parse initial state and reverts removed config keys to defaults
+	tmpDir, err := ioutil.TempDir("", "confi_review_watch_")
+	if err != nil {
+		t.Fatalf("TempDir failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfgPath := filepath.Join(tmpDir, "watch.yaml")
+	if err := ioutil.WriteFile(cfgPath, []byte("host: override.local\nport: 9000\n"), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	type WatchRevertCfg struct {
+		Host string            `confi:"host,default=default.local"`
+		Port int               `confi:"port,default=8080"`
+		Tags map[string]string `confi:"tags"`
+	}
+	watchCfg := WatchRevertCfg{
+		Tags: map[string]string{"init": "yes"},
+	}
+	reloadCh := make(chan error, 2)
+	watcher, err := Watch(&watchCfg, func(e error) {
+		reloadCh <- e
+	}, WithConfigFile(cfgPath), WithWatchInterval(15*time.Millisecond), WithArgs(nil))
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+	defer watcher.Close()
+
+	if watchCfg.Host != "override.local" || watchCfg.Port != 9000 {
+		t.Fatalf("unexpected initial watchCfg: %+v", watchCfg)
+	}
+
+	// Remove `host` from config file; reload should revert Host to default ("default.local")
+	time.Sleep(25 * time.Millisecond)
+	if err := ioutil.WriteFile(cfgPath, []byte("port: 9001\n"), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	select {
+	case rErr := <-reloadCh:
+		if rErr != nil {
+			t.Fatalf("reload failed: %v", rErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for reload")
+	}
+
+	watcher.RLock()
+	gotHost, gotPort, gotInitTag := watchCfg.Host, watchCfg.Port, watchCfg.Tags["init"]
+	watcher.RUnlock()
+	if gotHost != "default.local" || gotPort != 9001 || gotInitTag != "yes" {
+		t.Fatalf("expected Host='default.local', Port=9001, Tags[init]='yes', got host=%q port=%d tag=%q", gotHost, gotPort, gotInitTag)
+	}
+
+	// 2. *time.Duration pointer with min/max tags
+	type PtrDurCfg struct {
+		Timeout *time.Duration `confi:"timeout,min=100ms,max=5s"`
+	}
+	var ptrDur PtrDurCfg
+	if err := Parse(&ptrDur, WithArgs([]string{"--timeout=500ms"})); err != nil {
+		t.Fatalf("expected valid *time.Duration to pass, got: %v", err)
+	}
+	if ptrDur.Timeout == nil || *ptrDur.Timeout != 500*time.Millisecond {
+		t.Fatalf("unexpected *time.Duration value: %v", ptrDur.Timeout)
+	}
+	if err := Parse(&ptrDur, WithArgs([]string{"--timeout=20ms"})); err == nil || !strings.Contains(err.Error(), "less than minimum") {
+		t.Fatalf("expected min error on *time.Duration, got: %v", err)
+	}
+
+	// 3. Strict mode rejects stray positional token after string flag
+	type StrictStrCfg struct {
+		Host string `confi:"host"`
+	}
+	var strictStr StrictStrCfg
+	if err := Parse(&strictStr, WithStrict(true), WithArgs([]string{"--host", "example.com", "stray_positional"})); err == nil || !strings.Contains(err.Error(), "unexpected positional argument") {
+		t.Fatalf("expected strict mode error on stray positional token after string flag, got: %v (Host=%q)", err, strictStr.Host)
+	}
+
+	// 4. YAML sequence item starting with nested mapping key (`- nested:`)
+	type NestedNode struct {
+		Host string `yaml:"host"`
+	}
+	type SeqItem struct {
+		Nested NestedNode `yaml:"nested"`
+		Name   string     `yaml:"name"`
+	}
+	type SeqCfg struct {
+		Items []SeqItem `confi:"items"`
+	}
+	yamlSeqData := "items:\n  - nested:\n      host: db1.local\n    name: primary\n"
+	var seqCfg SeqCfg
+	if err := Parse(&seqCfg, WithConfigReader(strings.NewReader(yamlSeqData), FormatYAML), WithArgs(nil)); err != nil {
+		t.Fatalf("YAML sequence with nested mapping failed: %v", err)
+	}
+	if len(seqCfg.Items) != 1 || seqCfg.Items[0].Nested.Host != "db1.local" || seqCfg.Items[0].Name != "primary" {
+		t.Fatalf("unexpected YAML sequence items: %+v", seqCfg.Items)
+	}
+
+	// 5. TOML quoted dots in section names and colons before '='
+	type TOMLQuotedCfg struct {
+		Servers map[string]map[string]string `confi:"servers"`
+	}
+	tomlQuoted := "[servers.\"us.east\"]\n\"urn:endpoint\" = \"https://us-east.example.com:8443\"\n"
+	var tqCfg TOMLQuotedCfg
+	if err := Parse(&tqCfg, WithConfigReader(strings.NewReader(tomlQuoted), FormatTOML), WithArgs(nil)); err != nil {
+		t.Fatalf("TOML quoted section parse failed: %v", err)
+	}
+	if tqCfg.Servers["us.east"]["urn:endpoint"] != "https://us-east.example.com:8443" {
+		t.Fatalf("unexpected TOML quoted section result: %+v", tqCfg.Servers)
+	}
+}
+
+func TestFormatParserBugFixes(t *testing.T) {
+	// MAJ-08: TOML multiline triple-quoted strings with comments, quotes, and escapes
+	t.Run("MAJ-08_TOMLMultilineStrings", func(t *testing.T) {
+		type Cfg struct {
+			Query string `confi:"query"`
+			Note  string `confi:"note"`
+			Raw   string `confi:"raw"`
+		}
+		tomlData := `
+query = """
+SELECT "#1", note FROM users
+WHERE name = "Alice" # not a comment inside string
+"""
+note = """He said "hello world"""" # trailing comment
+raw = '''
+C:\Users\admin\Documents # literal comment preserved
+'''
+`
+		var cfg Cfg
+		if err := Parse(&cfg, WithConfigReader(strings.NewReader(tomlData), FormatTOML), WithArgs(nil)); err != nil {
+			t.Fatalf("failed to parse TOML multiline strings: %v", err)
+		}
+		if !strings.Contains(cfg.Query, `"#1"`) || !strings.Contains(cfg.Query, `WHERE name = "Alice" # not a comment inside string`) {
+			t.Fatalf("multiline query corrupted by comment stripper: %q", cfg.Query)
+		}
+		if cfg.Note != `He said "hello world"` {
+			t.Fatalf("multiline note mismatch: expected %q, got %q", `He said "hello world"`, cfg.Note)
+		}
+		if !strings.Contains(cfg.Raw, `C:\Users\admin\Documents # literal comment preserved`) {
+			t.Fatalf("literal multiline raw mismatch: %q", cfg.Raw)
+		}
+	})
+
+	// MAJ-10: TOML section header overwriting prior scalar key without error
+	t.Run("MAJ-10_TOMLTableRedefiningScalarError", func(t *testing.T) {
+		type Cfg struct {
+			Server string `confi:"server"`
+		}
+		tomlData := "server = \"localhost\"\n[server]\nport = 8080\n"
+		var cfg Cfg
+		err := Parse(&cfg, WithConfigReader(strings.NewReader(tomlData), FormatTOML), WithArgs(nil))
+		if err == nil {
+			t.Fatal("expected syntax error when TOML table redefines an existing scalar, got nil")
+		}
+		if !strings.Contains(err.Error(), "already defined") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	// MIN-16: Semicolon in TOML URIs/DSNs not stripped as comment
+	t.Run("MIN-16_TOMLDSNWithSemicolon", func(t *testing.T) {
+		type Cfg struct {
+			DSN    string `confi:"dsn"`
+			RawDSN string `confi:"raw_dsn"`
+		}
+		tomlData := "dsn = \"postgres://user:pass@localhost:5432/db;sslmode=disable\"\nraw_dsn = postgres://user:pass@localhost:5432/db;sslmode=disable\n"
+		var cfg Cfg
+		if err := Parse(&cfg, WithConfigReader(strings.NewReader(tomlData), FormatTOML), WithArgs(nil)); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DSN != "postgres://user:pass@localhost:5432/db;sslmode=disable" {
+			t.Fatalf("semicolon was stripped from quoted DSN: got %q", cfg.DSN)
+		}
+		if cfg.RawDSN != "postgres://user:pass@localhost:5432/db;sslmode=disable" {
+			t.Fatalf("semicolon was stripped from unquoted DSN: got %q", cfg.RawDSN)
+		}
+	})
+
+	// MAJ-12: Top-level YAML sequence returns error
+	t.Run("MAJ-12_YAMLRootSequenceError", func(t *testing.T) {
+		type Cfg struct {
+			Items []string `confi:"items"`
+		}
+		yamlData := "- first\n- second\n- third\n"
+		var cfg Cfg
+		err := Parse(&cfg, WithConfigReader(strings.NewReader(yamlData), FormatYAML), WithArgs(nil))
+		if err == nil {
+			t.Fatal("expected error when YAML root document is a sequence, got nil")
+		}
+		if !strings.Contains(err.Error(), "root document must be a mapping") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	// MAJ-13: Multi-document YAML stream rejected
+	t.Run("MAJ-13_YAMLMultiDocumentStream", func(t *testing.T) {
+		type Cfg struct {
+			Env string `confi:"env"`
+		}
+		yamlData := "env: production\n---\nenv: development\n"
+		var cfg Cfg
+		err := Parse(&cfg, WithConfigReader(strings.NewReader(yamlData), FormatYAML), WithArgs(nil))
+		if err == nil {
+			t.Fatal("expected error for multi-document YAML stream, got nil")
+		}
+		if !strings.Contains(err.Error(), "multi-document") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	// MAJ-14: Unbounded recursion depth in YAML parser guarded
+	t.Run("MAJ-14_YAMLRecursionLimit", func(t *testing.T) {
+		type Cfg struct {
+			Data interface{} `confi:"data"`
+		}
+		deepFlow := strings.Repeat("[", 250) + "1" + strings.Repeat("]", 250)
+		yamlData := "data: " + deepFlow + "\n"
+		var cfg Cfg
+		err := Parse(&cfg, WithConfigReader(strings.NewReader(yamlData), FormatYAML), WithArgs(nil))
+		if err == nil {
+			t.Fatal("expected error on deeply nested YAML structure exceeding depth limit, got nil")
+		}
+		if !strings.Contains(err.Error(), "depth") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	// MIN-14: Unicode and control escape sequences in YAML and TOML
+	t.Run("MIN-14_UnicodeAndControlEscapes", func(t *testing.T) {
+		type Cfg struct {
+			Unicode string `confi:"unicode"`
+			Ctrl    string `confi:"ctrl"`
+			Emoji   string `confi:"emoji"`
+		}
+		yamlData := "unicode: \"\\u0041\\u0042\\u0043\"\nctrl: \"\\b\\f\"\nemoji: \"\\U0001F600\"\n"
+		var cfg Cfg
+		if err := Parse(&cfg, WithConfigReader(strings.NewReader(yamlData), FormatYAML), WithArgs(nil)); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Unicode != "ABC" {
+			t.Fatalf("expected 'ABC', got %q", cfg.Unicode)
+		}
+		if cfg.Ctrl != "\b\f" {
+			t.Fatalf("expected '\\b\\f', got %q", cfg.Ctrl)
+		}
+		if cfg.Emoji != "😀" {
+			t.Fatalf("expected '😀', got %q", cfg.Emoji)
+		}
+
+		tomlData := "unicode = \"\\u0041\\u0042\\u0043\"\nctrl = \"\\b\\f\"\nemoji = \"\\U0001F600\"\n"
+		var tomlCfg Cfg
+		if err := Parse(&tomlCfg, WithConfigReader(strings.NewReader(tomlData), FormatTOML), WithArgs(nil)); err != nil {
+			t.Fatal(err)
+		}
+		if tomlCfg.Unicode != "ABC" || tomlCfg.Ctrl != "\b\f" || tomlCfg.Emoji != "😀" {
+			t.Fatalf("unexpected TOML escapes: %+v", tomlCfg)
+		}
+	})
+
+	// MIN-15: Flawed isQuotedYAML detection
+	t.Run("MIN-15_IsQuotedYAML", func(t *testing.T) {
+		if isQuotedYAML(`"foo" and "bar"`) {
+			t.Fatal(`expected false for '"foo" and "bar"'`)
+		}
+		if isQuotedYAML(`'foo' and 'bar'`) {
+			t.Fatal(`expected false for "'foo' and 'bar'"`)
+		}
+		if !isQuotedYAML(`"foo \"bar\""`) {
+			t.Fatal(`expected true for valid escaped double-quoted string`)
+		}
+		if !isQuotedYAML(`'foo ''bar'''`) {
+			t.Fatal(`expected true for valid escaped single-quoted string`)
+		}
+	})
+
+	// MIN-17: Trailing garbage rejected in .env
+	t.Run("MIN-17_DotEnvTrailingGarbage", func(t *testing.T) {
+		type Cfg struct {
+			Val string `confi:"val"`
+		}
+		var cfg Cfg
+		err := Parse(&cfg, WithConfigReader(strings.NewReader("VAL='test'trailing\n"), FormatEnv), WithArgs(nil))
+		if err == nil {
+			t.Fatal("expected error on trailing characters after single-quoted .env value, got nil")
+		}
+		err2 := Parse(&cfg, WithConfigReader(strings.NewReader("VAL=\"test\"trailing\n"), FormatEnv), WithArgs(nil))
+		if err2 == nil {
+			t.Fatal("expected error on trailing characters after double-quoted .env value, got nil")
+		}
+	})
+
+	// MIN-18: Double unescaping defect \\$ in .env
+	t.Run("MIN-18_DotEnvEscapedBackslashDollar", func(t *testing.T) {
+		type Cfg struct {
+			LiteralDollar string `confi:"literal_dollar"`
+			EscapedSlash  string `confi:"escaped_slash"`
+		}
+		dotEnvData := "LITERAL_DOLLAR=\"\\$foo\"\nESCAPED_SLASH=\"\\\\$foo\"\n"
+		var cfg Cfg
+		if err := Parse(&cfg, WithConfigReader(strings.NewReader(dotEnvData), FormatEnv), WithArgs(nil)); err != nil {
+			t.Fatalf("failed to parse .env: %v", err)
+		}
+		if cfg.LiteralDollar != "$foo" {
+			t.Fatalf("expected '$foo', got %q", cfg.LiteralDollar)
+		}
+		if cfg.EscapedSlash != "\\$foo" {
+			t.Fatalf("expected '\\$foo', got %q", cfg.EscapedSlash)
+		}
+	})
+
+	// ADD-DEF-01: Case-insensitive export prefix
+	t.Run("ADD-DEF-01_DotEnvExportCaseInsensitivity", func(t *testing.T) {
+		type Cfg struct {
+			Host string `confi:"host"`
+			Port int    `confi:"port"`
+		}
+		var cfg Cfg
+		envData := "EXPORT HOST=127.0.0.1\nexport PORT=8080\n"
+		if err := Parse(&cfg, WithConfigReader(strings.NewReader(envData), FormatEnv), WithArgs(nil)); err != nil {
+			t.Fatalf("failed to parse EXPORT prefix: %v", err)
+		}
+		if cfg.Host != "127.0.0.1" || cfg.Port != 8080 {
+			t.Fatalf("expected 127.0.0.1:8080, got %s:%d", cfg.Host, cfg.Port)
+		}
+	})
+
+	// MAJ-15: Auto-detection of TOML with top-level keys
+	t.Run("MAJ-15_DetectFormatTopLevelTOML", func(t *testing.T) {
+		type ServerCfg struct {
+			Host string `confi:"host"`
+			Port int    `confi:"port"`
+		}
+		type Cfg struct {
+			Title  string    `confi:"title"`
+			Server ServerCfg `confi:"server"`
+		}
+		tomlData := "title = \"My Service\"\n[server]\nhost = \"127.0.0.1\"\nport = 8080\n"
+		var cfg Cfg
+		err := Parse(&cfg, WithConfigReader(strings.NewReader(tomlData), FormatAuto), WithArgs(nil))
+		if err != nil {
+			t.Fatalf("failed to auto-detect and parse TOML with top-level key: %v", err)
+		}
+		if cfg.Title != "My Service" || cfg.Server.Host != "127.0.0.1" || cfg.Server.Port != 8080 {
+			t.Fatalf("unexpected parsed result: %+v", cfg)
+		}
+	})
+
+	// MAJ-16 & MIN-12: Deterministic key lookup in findKeyInMap
+	t.Run("MAJ-16_MIN-12_DeterministicMapKeyBinding", func(t *testing.T) {
+		type Cfg struct {
+			UserID string `confi:"user_id"`
+		}
+		m := map[string]interface{}{
+			"userId": "camelCaseVal",
+			"userid": "lowerVal",
+		}
+		var firstVal string
+		for i := 0; i < 50; i++ {
+			var cfg Cfg
+			p := NewParser("test")
+			schema, rootVal, err := extractSchema(&cfg)
+			if err != nil {
+				t.Fatalf("extractSchema failed: %v", err)
+			}
+			err = p.applyStructuredMap(m, schema, rootVal, make(map[*fieldMeta]valueSource))
+			if err != nil {
+				t.Fatalf("applyStructuredMap failed: %v", err)
+			}
+			if i == 0 {
+				firstVal = cfg.UserID
+			} else if cfg.UserID != firstVal {
+				t.Fatalf("non-deterministic binding on iteration %d: got %q, expected %q", i, cfg.UserID, firstVal)
+			}
+		}
+	})
+
+	// MIN-13: Slice allocation in assignInterfaceValue
+	t.Run("MIN-13_SliceAssignmentCorrectness", func(t *testing.T) {
+		type Cfg struct {
+			Endpoints []string `confi:"endpoints"`
+		}
+		yamlData := "endpoints:\n  - ep1\n  - ep2\n  - ep3\n"
+		var cfg Cfg
+		if err := Parse(&cfg, WithConfigReader(strings.NewReader(yamlData), FormatYAML), WithArgs(nil)); err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.Endpoints) != 3 || cfg.Endpoints[0] != "ep1" || cfg.Endpoints[1] != "ep2" || cfg.Endpoints[2] != "ep3" {
+			t.Fatalf("unexpected endpoints: %+v", cfg.Endpoints)
+		}
+	})
+}
+
+func TestCoreEngineBugFixes(t *testing.T) {
+	// MIN-02: Support dynamic config file loading on subcommands
+	t.Run("MIN-02_SubcommandConfigFileLoading", func(t *testing.T) {
+		type WorkerCmd struct {
+			ConfigFile  string `confi:"config,config"`
+			Concurrency int    `confi:"concurrency" default:"1"`
+			Queue       string `confi:"queue" default:"default"`
+		}
+		type AppCfg struct {
+			GlobalHost string    `confi:"host" default:"localhost"`
+			Worker     WorkerCmd `confi:"worker,subcommand"`
+		}
+
+		tmpDir, err := ioutil.TempDir("", "confi_subcmd_cfg_")
+		if err != nil {
+			t.Fatalf("TempDir failed: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		workerYaml := filepath.Join(tmpDir, "worker.yaml")
+		if err := ioutil.WriteFile(workerYaml, []byte("concurrency: 8\nqueue: critical\n"), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		// Test 1: passing --config to subcommand
+		var app1 AppCfg
+		err = Parse(&app1, WithStrict(true), WithArgs([]string{"worker", "--config", workerYaml}))
+		if err != nil {
+			t.Fatalf("Parse failed for subcommand with --config: %v", err)
+		}
+		if app1.Worker.Concurrency != 8 || app1.Worker.Queue != "critical" {
+			t.Fatalf("expected concurrency 8 and queue critical, got: %+v", app1.Worker)
+		}
+
+		// Test 2: subcommand struct with default config file and root config isolation
+		type ServerCmd struct {
+			ConfigFile string `confi:"config,config"`
+			Port       int    `confi:"port"`
+		}
+		type AppCfg2 struct {
+			RootKey string    `confi:"root_key"`
+			Server  ServerCmd `confi:"server,subcommand"`
+		}
+		serverJson := filepath.Join(tmpDir, "server.json")
+		if err := ioutil.WriteFile(serverJson, []byte(`{"port": 9090}`), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		rootValidYaml := filepath.Join(tmpDir, "root_valid.yaml")
+		if err := ioutil.WriteFile(rootValidYaml, []byte("root_key: root_val\n"), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		var app2 AppCfg2
+		err = Parse(&app2, WithStrict(true), WithConfigFile(rootValidYaml), WithArgs([]string{"server", "--config", serverJson}))
+		if err != nil {
+			t.Fatalf("Parse failed with root config and subcommand config: %v", err)
+		}
+		if app2.RootKey != "root_val" {
+			t.Errorf("expected RootKey 'root_val', got %q", app2.RootKey)
+		}
+		if app2.Server.Port != 9090 {
+			t.Errorf("expected Server.Port 9090, got %d", app2.Server.Port)
+		}
+	})
+
+	// MIN-03: Asymmetric empty prefix handling (WithPrefix(""))
+	t.Run("MIN-03_EmptyPrefixHandling", func(t *testing.T) {
+		type Cfg struct {
+			Target string `confi:"target,pos"`
+		}
+		var cfg Cfg
+		// WithPrefix(""): "--custom-pos" is not recognized as a long flag, so it becomes a positional argument
+		err := Parse(&cfg, WithPrefix(""), WithArgs([]string{"--custom-pos"}))
+		if err != nil {
+			t.Fatalf("Parse with empty prefix failed: %v", err)
+		}
+		if cfg.Target != "--custom-pos" {
+			t.Fatalf("expected Target '--custom-pos', got %q", cfg.Target)
+		}
+
+		// Custom prefix e.g. "/"
+		type SlashCfg struct {
+			Port int `confi:"port"`
+		}
+		var slashCfg SlashCfg
+		err = Parse(&slashCfg, WithPrefix("/"), WithArgs([]string{"/port=8080"}))
+		if err != nil {
+			t.Fatalf("Parse with slash prefix failed: %v", err)
+		}
+		if slashCfg.Port != 8080 {
+			t.Fatalf("expected Port 8080, got %d", slashCfg.Port)
+		}
+	})
+
+	// INFO-01: WithAutoEnv boolean toggle
+	t.Run("INFO-01_WithAutoEnvToggle", func(t *testing.T) {
+		type Cfg struct {
+			DbUser string
+		}
+		lookup := func(k string) (string, bool) {
+			if k == "DB_USER" {
+				return "admin", true
+			}
+			return "", false
+		}
+
+		// 1. WithAutoEnv() defaults to true
+		var cfg1 Cfg
+		if err := Parse(&cfg1, WithAutoEnv(), WithEnvLookup(lookup), WithArgs(nil)); err != nil {
+			t.Fatal(err)
+		}
+		if cfg1.DbUser != "admin" {
+			t.Fatalf("expected DbUser 'admin' with WithAutoEnv(), got %q", cfg1.DbUser)
+		}
+
+		// 2. WithAutoEnv(true) explicitly enables
+		var cfg2 Cfg
+		if err := Parse(&cfg2, WithAutoEnv(true), WithEnvLookup(lookup), WithArgs(nil)); err != nil {
+			t.Fatal(err)
+		}
+		if cfg2.DbUser != "admin" {
+			t.Fatalf("expected DbUser 'admin' with WithAutoEnv(true), got %q", cfg2.DbUser)
+		}
+
+		// 3. WithAutoEnv(false) explicitly disables
+		var cfg3 Cfg
+		if err := Parse(&cfg3, WithAutoEnv(false), WithEnvLookup(lookup), WithArgs(nil)); err != nil {
+			t.Fatal(err)
+		}
+		if cfg3.DbUser != "" {
+			t.Fatalf("expected DbUser empty with WithAutoEnv(false), got %q", cfg3.DbUser)
+		}
+	})
+
+	// MIN-05: splitTagParts with double quotes and escapes
+	t.Run("MIN-05_DoubleQuotedTagSplitting", func(t *testing.T) {
+		type Cfg struct {
+			Color   string `confi:"usage=\"Select: red, green, or blue\",default=\"red,green\""`
+			Escaped string `confi:"usage=\"Press \\\"Enter\\\" to proceed\",default=\"a,b\""`
+		}
+		var cfg Cfg
+		err := Parse(&cfg, WithArgs(nil))
+		if err != nil {
+			t.Fatalf("Parse failed: %v", err)
+		}
+		if cfg.Color != "red,green" {
+			t.Errorf("expected Color default 'red,green', got %q", cfg.Color)
+		}
+		if cfg.Escaped != "a,b" {
+			t.Errorf("expected Escaped default 'a,b', got %q", cfg.Escaped)
+		}
+
+		// Verify usage string
+		usageStr, err := Usage(&cfg, WithName("testapp"))
+		if err != nil {
+			t.Fatalf("Usage failed: %v", err)
+		}
+		if !strings.Contains(usageStr, "Select: red, green, or blue") {
+			t.Errorf("expected usage to contain 'Select: red, green, or blue', got:\n%s", usageStr)
+		}
+		if !strings.Contains(usageStr, `Press "Enter" to proceed`) {
+			t.Errorf("expected usage to contain 'Press \"Enter\" to proceed', got:\n%s", usageStr)
+		}
+	})
+
+	// MIN-06: Conflicting flag aliases across distinct fields
+	t.Run("MIN-06_DuplicateLongFlagError", func(t *testing.T) {
+		type DupCfg struct {
+			Addr1 string `confi:"addr"`
+			Addr2 string `confi:"addr"`
+		}
+		var cfg DupCfg
+		err := Parse(&cfg, WithArgs(nil))
+		if err == nil {
+			t.Fatal("expected error on duplicate long flag alias, got nil")
+		}
+		if !strings.Contains(err.Error(), "duplicate flag \"addr\"") {
+			t.Fatalf("expected duplicate flag error message, got: %v", err)
+		}
+	})
+
+	// MIN-07 (schema preparation): minStr and maxStr stored on fieldMeta
+	t.Run("MIN-07_FieldMetaMinMaxStrings", func(t *testing.T) {
+		type BoundsCfg struct {
+			BigUint uint64 `confi:"min=9007199254740993,max=18446744073709551615"`
+			BigInt  int64  `confi:"min=-9223372036854775807,max=9223372036854775806"`
+		}
+		schema, _, err := extractSchema(&BoundsCfg{})
+		if err != nil {
+			t.Fatalf("extractSchema failed: %v", err)
+		}
+		if len(schema.fields) != 2 {
+			t.Fatalf("expected 2 fields, got %d", len(schema.fields))
+		}
+		f0 := schema.fields[0]
+		if f0.minStr != "9007199254740993" || f0.maxStr != "18446744073709551615" {
+			t.Errorf("f0 minStr=%q, maxStr=%q", f0.minStr, f0.maxStr)
+		}
+		f1 := schema.fields[1]
+		if f1.minStr != "-9223372036854775807" || f1.maxStr != "9223372036854775806" {
+			t.Errorf("f1 minStr=%q, maxStr=%q", f1.minStr, f1.maxStr)
+		}
+	})
+
+	// MIN-10: Inefficient struct isZeroValue via DeepEqual
+	t.Run("MIN-10_ZeroAllocStructIsZeroValue", func(t *testing.T) {
+		type Inner struct {
+			A int
+			B string
+		}
+		type Outer struct {
+			X Inner
+			Y float64
+		}
+		zeroVal := Outer{}
+		nonZeroVal := Outer{X: Inner{A: 10}}
+
+		// Verify correctness
+		if !isZeroValue(reflect.ValueOf(zeroVal)) {
+			t.Error("expected zeroVal to be identified as zero")
+		}
+		if isZeroValue(reflect.ValueOf(nonZeroVal)) {
+			t.Error("expected nonZeroVal to NOT be identified as zero")
+		}
+
+		// Verify zero heap allocations
+		rv := reflect.ValueOf(zeroVal)
+		allocs := testing.AllocsPerRun(100, func() {
+			_ = isZeroValue(rv)
+		})
+		if allocs > 0 {
+			t.Errorf("expected 0 allocs for isZeroValue on struct, got %f", allocs)
+		}
+	})
+
+	// MIN-11: Defensive isBoolValue / assignFromStrings handling
+	t.Run("MIN-11_IsBoolValueDefensiveHandling", func(t *testing.T) {
+		var b bool
+		fvBool := reflect.ValueOf(&b).Elem()
+		if !isBoolValue(fvBool) {
+			t.Error("expected isBoolValue(bool) to be true")
+		}
+		// Passing empty raws to assignFromStrings on a boolean sets it to true
+		if err := assignFromStrings(fvBool, nil, "", false); err != nil {
+			t.Fatalf("assignFromStrings on bool with nil raws failed: %v", err)
+		}
+		if !b {
+			t.Error("expected b to be set to true")
+		}
+
+		// Passing empty raws on a non-bool type returns missing value error
+		var num int
+		fvInt := reflect.ValueOf(&num).Elem()
+		if isBoolValue(fvInt) {
+			t.Error("expected isBoolValue(int) to be false")
+		}
+		err := assignFromStrings(fvInt, nil, "", false)
+		if err == nil || !strings.Contains(err.Error(), "missing value for int") {
+			t.Fatalf("expected 'missing value for int' error, got: %v", err)
+		}
+
+		// Invalid reflect value
+		if isBoolValue(reflect.Value{}) {
+			t.Error("expected isBoolValue(invalid) to be false")
+		}
+	})
+}
+
+type validatedTestPort int
+
+func (p validatedTestPort) Validate() error {
+	if p < 1 || p > 65535 {
+		return fmt.Errorf("invalid port %d", p)
+	}
+	return nil
+}
+
+type validatedTestSubItem struct {
+	Val string `confi:"val"`
+}
+
+func (s *validatedTestSubItem) Validate() error {
+	if s.Val == "forbidden" {
+		return errors.New("forbidden item value")
+	}
+	return nil
+}
+
+func TestValidationAndWatcherBugFixes(t *testing.T) {
+	// MIN-07: uint64 and int64 precision around 2^53 and boundary conditions
+	t.Run("MIN-07_Uint64PrecisionAndLargeBounds", func(t *testing.T) {
+		type BigUintCfg struct {
+			Val uint64 `confi:"val,min=9007199254740993,max=9007199254740995"`
+		}
+
+		// Exact min boundary: 9007199254740993 passes
+		var c1 BigUintCfg
+		if err := Parse(&c1, WithArgs([]string{"--val=9007199254740993"})); err != nil {
+			t.Fatalf("expected min boundary 9007199254740993 to pass, got: %v", err)
+		}
+		if c1.Val != 9007199254740993 {
+			t.Fatalf("expected Val=9007199254740993, got %d", c1.Val)
+		}
+
+		// One below min: 9007199254740992 fails
+		var c2 BigUintCfg
+		err := Parse(&c2, WithArgs([]string{"--val=9007199254740992"}))
+		if err == nil || !strings.Contains(err.Error(), "less than minimum") {
+			t.Fatalf("expected 'less than minimum' error for 9007199254740992, got: %v", err)
+		}
+
+		// Exact max boundary: 9007199254740995 passes
+		var c3 BigUintCfg
+		if err := Parse(&c3, WithArgs([]string{"--val=9007199254740995"})); err != nil {
+			t.Fatalf("expected max boundary 9007199254740995 to pass, got: %v", err)
+		}
+
+		// One above max: 9007199254740996 fails
+		var c4 BigUintCfg
+		err = Parse(&c4, WithArgs([]string{"--val=9007199254740996"}))
+		if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+			t.Fatalf("expected 'exceeds maximum' error for 9007199254740996, got: %v", err)
+		}
+
+		// math.MaxUint64 (18446744073709551615) supported without float overflow
+		type MaxUint64Cfg struct {
+			Val uint64 `confi:"val,min=18446744073709551610,max=18446744073709551615"`
+		}
+		var cMax MaxUint64Cfg
+		if err := Parse(&cMax, WithArgs([]string{"--val=18446744073709551615"})); err != nil {
+			t.Fatalf("expected math.MaxUint64 to pass, got: %v", err)
+		}
+		if cMax.Val != 18446744073709551615 {
+			t.Fatalf("expected Val=18446744073709551615, got %d", cMax.Val)
+		}
+
+		var cMaxFail MaxUint64Cfg
+		err = Parse(&cMaxFail, WithArgs([]string{"--val=18446744073709551609"}))
+		if err == nil || !strings.Contains(err.Error(), "less than minimum") {
+			t.Fatalf("expected less than minimum error for 18446744073709551609, got: %v", err)
+		}
+
+		// Big int64 (> 2^53)
+		type BigIntCfg struct {
+			Val int64 `confi:"val,min=-9007199254740995,max=9007199254740995"`
+		}
+		var ci1 BigIntCfg
+		if err := Parse(&ci1, WithArgs([]string{"--val=-9007199254740995"})); err != nil {
+			t.Fatalf("expected min int64 boundary to pass, got: %v", err)
+		}
+		var ci2 BigIntCfg
+		err = Parse(&ci2, WithArgs([]string{"--val=-9007199254740996"}))
+		if err == nil || !strings.Contains(err.Error(), "less than minimum") {
+			t.Fatalf("expected less than minimum error for -9007199254740996, got: %v", err)
+		}
+		var ci3 BigIntCfg
+		err = Parse(&ci3, WithArgs([]string{"--val=9007199254740996"}))
+		if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+			t.Fatalf("expected exceeds maximum error for 9007199254740996, got: %v", err)
+		}
+
+		// time.Duration and *time.Duration min/max comparisons preserved
+		type DurCfg struct {
+			Timeout    time.Duration  `confi:"timeout,min=100ms,max=5s"`
+			PtrTimeout *time.Duration `confi:"ptr_timeout,min=50ms,max=2s"`
+		}
+		var durValid DurCfg
+		if err := Parse(&durValid, WithArgs([]string{"--timeout=500ms", "--ptr_timeout=500ms"})); err != nil {
+			t.Fatalf("expected valid durations to pass: %v", err)
+		}
+		var durMin DurCfg
+		err = Parse(&durMin, WithArgs([]string{"--timeout=20ms", "--ptr_timeout=500ms"}))
+		if err == nil || !strings.Contains(err.Error(), "less than minimum") {
+			t.Fatalf("expected min duration error, got: %v", err)
+		}
+		var durMax DurCfg
+		err = Parse(&durMax, WithArgs([]string{"--timeout=10s", "--ptr_timeout=500ms"}))
+		if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+			t.Fatalf("expected max duration error, got: %v", err)
+		}
+		var ptrMin DurCfg
+		err = Parse(&ptrMin, WithArgs([]string{"--timeout=500ms", "--ptr_timeout=10ms"}))
+		if err == nil || !strings.Contains(err.Error(), "less than minimum") {
+			t.Fatalf("expected min *time.Duration error, got: %v", err)
+		}
+		var ptrMax DurCfg
+		err = Parse(&ptrMax, WithArgs([]string{"--timeout=500ms", "--ptr_timeout=3s"}))
+		if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+			t.Fatalf("expected max *time.Duration error, got: %v", err)
+		}
+	})
+
+	// MIN-21: oneOf validation heap optimization & primitive types
+	t.Run("MIN-21_OneOfOptimizationAndPrimitives", func(t *testing.T) {
+		type ModeCfg struct {
+			Mode  string   `confi:"mode,oneof=read|write|admin,default=read"`
+			Modes []string `confi:"modes,oneof=json|yaml|xml"`
+			Level int      `confi:"level,oneof=1|2|3,default=1"`
+		}
+
+		var validCfg ModeCfg
+		if err := Parse(&validCfg, WithArgs([]string{"--mode=write", "--modes=json,yaml", "--level=2"})); err != nil {
+			t.Fatalf("expected valid oneof to pass, got: %v", err)
+		}
+		if validCfg.Mode != "write" || len(validCfg.Modes) != 2 || validCfg.Level != 2 {
+			t.Fatalf("unexpected ModeCfg values: %+v", validCfg)
+		}
+
+		var invalidMode ModeCfg
+		err := Parse(&invalidMode, WithArgs([]string{"--mode=execute"}))
+		if err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected oneof error for invalid mode, got: %v", err)
+		}
+
+		var invalidSliceElem ModeCfg
+		err = Parse(&invalidSliceElem, WithArgs([]string{"--modes=json,binary"}))
+		if err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected oneof error for invalid slice element, got: %v", err)
+		}
+
+		var invalidInt ModeCfg
+		err = Parse(&invalidInt, WithArgs([]string{"--level=5"}))
+		if err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected oneof error for invalid int level, got: %v", err)
+		}
+
+		// Zero heap allocation check for string oneOf fast-path
+		type AllocCheckCfg struct {
+			Role string `confi:"role,oneof=user|admin|guest"`
+		}
+		var allocCfg AllocCheckCfg
+		allocCfg.Role = "admin"
+		schema, rootVal, err := extractSchema(&allocCfg)
+		if err != nil {
+			t.Fatalf("extractSchema failed: %v", err)
+		}
+		fv, ok := schema.fields[0].fieldValue(rootVal, false)
+		if !ok {
+			t.Fatal("fieldValue failed")
+		}
+		allocs := testing.AllocsPerRun(100, func() {
+			_ = validateFieldConstraints(schema.fields[0], fv)
+		})
+		if allocs > 0 {
+			t.Errorf("expected 0 allocs for string oneOf validation, got %f", allocs)
+		}
+	})
+
+	// MIN-22: Collection & scalar Custom Validators traversal
+	t.Run("MIN-22_CollectionAndScalarCustomValidators", func(t *testing.T) {
+		// 1. Slice of scalar custom type implementing Validator
+		type SliceCustomCfg struct {
+			Ports []validatedTestPort `confi:"ports"`
+		}
+		var validPorts SliceCustomCfg
+		if err := Parse(&validPorts, WithArgs([]string{"--ports=80,443"})); err != nil {
+			t.Fatalf("expected valid ports to pass, got: %v", err)
+		}
+		if len(validPorts.Ports) != 2 || validPorts.Ports[0] != 80 || validPorts.Ports[1] != 443 {
+			t.Fatalf("unexpected ports: %+v", validPorts.Ports)
+		}
+
+		var invalidPorts SliceCustomCfg
+		err := Parse(&invalidPorts, WithArgs([]string{"--ports=80,99999"}))
+		if err == nil || !strings.Contains(err.Error(), "invalid port 99999") {
+			t.Fatalf("expected custom validator error for port 99999, got: %v", err)
+		}
+
+		// 2. Slice of pointer structs implementing Validator
+		type SliceStructCfg struct {
+			Items []*validatedTestSubItem `confi:"items"`
+		}
+		var validItems SliceStructCfg
+		validItems.Items = []*validatedTestSubItem{{Val: "ok1"}, {Val: "ok2"}}
+		if err := invokeCustomValidators(reflect.ValueOf(&validItems)); err != nil {
+			t.Fatalf("expected valid items to pass custom validator: %v", err)
+		}
+
+		var invalidItems SliceStructCfg
+		invalidItems.Items = []*validatedTestSubItem{{Val: "ok1"}, {Val: "forbidden"}}
+		err = invokeCustomValidators(reflect.ValueOf(&invalidItems))
+		if err == nil || !strings.Contains(err.Error(), "forbidden item value") {
+			t.Fatalf("expected forbidden item value error, got: %v", err)
+		}
+
+		// 3. Array of custom type implementing Validator
+		type ArrayCustomCfg struct {
+			Ports [2]validatedTestPort `confi:"ports"`
+		}
+		var validArray ArrayCustomCfg
+		validArray.Ports = [2]validatedTestPort{80, 443}
+		if err := invokeCustomValidators(reflect.ValueOf(&validArray)); err != nil {
+			t.Fatalf("expected valid array to pass: %v", err)
+		}
+		var invalidArray ArrayCustomCfg
+		invalidArray.Ports = [2]validatedTestPort{80, 99999}
+		err = invokeCustomValidators(reflect.ValueOf(&invalidArray))
+		if err == nil || !strings.Contains(err.Error(), "invalid port 99999") {
+			t.Fatalf("expected custom validator error on array element, got: %v", err)
+		}
+
+		// 4. Map of structs implementing Validator
+		type MapValCfg struct {
+			Nodes map[string]validatedTestSubItem `confi:"nodes"`
+		}
+		var validMap MapValCfg
+		validMap.Nodes = map[string]validatedTestSubItem{"node1": {Val: "healthy"}}
+		if err := invokeCustomValidators(reflect.ValueOf(&validMap)); err != nil {
+			t.Fatalf("expected valid map values to pass: %v", err)
+		}
+		var invalidMap MapValCfg
+		invalidMap.Nodes = map[string]validatedTestSubItem{"node1": {Val: "forbidden"}}
+		err = invokeCustomValidators(reflect.ValueOf(&invalidMap))
+		if err == nil || !strings.Contains(err.Error(), "forbidden item value") {
+			t.Fatalf("expected custom validator error on map value, got: %v", err)
+		}
+
+		// 5. Cyclic pointer structures guard
+		type CyclicNode struct {
+			Next *CyclicNode
+			Val  int
+		}
+		node1 := &CyclicNode{Val: 1}
+		node2 := &CyclicNode{Val: 2, Next: node1}
+		node1.Next = node2
+		if err := invokeCustomValidators(reflect.ValueOf(node1)); err != nil {
+			t.Fatalf("expected cyclic node validation to terminate cleanly, got: %v", err)
+		}
+	})
+
+	// MIN-27: Watcher without configuration files returns descriptive error
+	t.Run("MIN-27_WatchWithNoConfigFilesReturnsError", func(t *testing.T) {
+		type NoConfigCfg struct {
+			Host string `confi:"host"`
+			Port int    `confi:"port"`
+		}
+		var noCfg NoConfigCfg
+
+		// 1. Package Watch() without config files returns error
+		w, err := Watch(&noCfg, func(err error) {}, WithArgs(nil))
+		if err == nil {
+			if w != nil {
+				w.Stop()
+			}
+			t.Fatal("expected error when no config files are specified for Watch, got nil")
+		}
+		if w != nil {
+			w.Stop()
+			t.Fatal("expected Watcher to be nil on error")
+		}
+		if err.Error() != "confi: no configuration files found to watch" {
+			t.Fatalf("unexpected error message: got %q, expected 'confi: no configuration files found to watch'", err.Error())
+		}
+
+		// 2. Parser.Watch() without config files returns error
+		p := NewParser("testapp", WithArgs(nil))
+		w2, err2 := p.Watch(&noCfg, func(err error) {})
+		if err2 == nil {
+			if w2 != nil {
+				w2.Stop()
+			}
+			t.Fatal("expected error from p.Watch when no config files specified, got nil")
+		}
+		if w2 != nil {
+			w2.Stop()
+			t.Fatal("expected Watcher to be nil on error")
+		}
+		if err2.Error() != "confi: no configuration files found to watch" {
+			t.Fatalf("unexpected error message from p.Watch: got %q", err2.Error())
+		}
+	})
+}
+
+func TestCLIPresentationBugFixes(t *testing.T) {
+	// 1. MIN-19: SubcommandUsage and WriteSubcommandUsage
+	t.Run("MIN-19_SubcommandUsage", func(t *testing.T) {
+		type MigrateCmd struct {
+			DryRun bool `confi:"dry-run,usage='Run migration in dry-run mode'"`
+		}
+		type RootApp struct {
+			Verbose bool       `confi:"verbose,usage='Enable verbose logging'"`
+			Migrate MigrateCmd `confi:"migrate,subcommand,usage='Execute database migrations'"`
+		}
+
+		app := RootApp{}
+
+		// Test public SubcommandUsage
+		usageStr, err := SubcommandUsage(&app, "migrate", WithName("myapp"))
+		if err != nil {
+			t.Fatalf("SubcommandUsage failed: %v", err)
+		}
+		if !strings.Contains(usageStr, "Usage: myapp migrate [flags]") {
+			t.Errorf("expected usage header 'Usage: myapp migrate [flags]', got:\n%s", usageStr)
+		}
+		if !strings.Contains(usageStr, "--dry-run") {
+			t.Errorf("expected '--dry-run' in subcommand usage, got:\n%s", usageStr)
+		}
+		if !strings.Contains(usageStr, "Run migration in dry-run mode") {
+			t.Errorf("expected usage description in subcommand usage, got:\n%s", usageStr)
+		}
+		if strings.Contains(usageStr, "--verbose") {
+			t.Errorf("subcommand usage should not contain root flag --verbose, got:\n%s", usageStr)
+		}
+
+		// Test WriteSubcommandUsage
+		var buf bytes.Buffer
+		if err := WriteSubcommandUsage(&buf, &app, "migrate", WithName("myapp")); err != nil {
+			t.Fatalf("WriteSubcommandUsage failed: %v", err)
+		}
+		if buf.String() != usageStr {
+			t.Errorf("WriteSubcommandUsage output mismatch: got %q, expected %q", buf.String(), usageStr)
+		}
+
+		// Test Parser methods
+		p := NewParser("customapp")
+		pUsage, err := p.SubcommandUsage(&app, "migrate")
+		if err != nil {
+			t.Fatalf("p.SubcommandUsage failed: %v", err)
+		}
+		if !strings.Contains(pUsage, "Usage: customapp migrate [flags]") {
+			t.Errorf("expected custom parser app name, got:\n%s", pUsage)
+		}
+
+		var pBuf bytes.Buffer
+		if err := p.WriteSubcommandUsage(&pBuf, &app, "migrate"); err != nil {
+			t.Fatalf("p.WriteSubcommandUsage failed: %v", err)
+		}
+		if pBuf.String() != pUsage {
+			t.Errorf("p.WriteSubcommandUsage output mismatch")
+		}
+
+		// Test case-insensitivity and trim
+		ciUsage, err := SubcommandUsage(&app, "  MIGRATE  ", WithName("myapp"))
+		if err != nil {
+			t.Fatalf("case-insensitive SubcommandUsage failed: %v", err)
+		}
+		if !strings.Contains(ciUsage, "--dry-run") {
+			t.Errorf("expected --dry-run in case-insensitive usage, got:\n%s", ciUsage)
+		}
+
+		// Test unknown subcommand returns descriptive ParseError
+		_, err = SubcommandUsage(&app, "unknown")
+		if err == nil {
+			t.Fatal("expected error for unknown subcommand, got nil")
+		}
+		parseErr, ok := err.(*ParseError)
+		if !ok {
+			t.Fatalf("expected *ParseError for unknown subcommand, got %T: %v", err, err)
+		}
+		if !strings.Contains(parseErr.Error(), `unknown subcommand "unknown"`) {
+			t.Fatalf("unexpected error message: %v", parseErr)
+		}
+
+		// Test nil target
+		if _, err := SubcommandUsage(nil, "migrate"); err == nil {
+			t.Fatal("expected error for nil target")
+		}
+	})
+
+	// 2. MIN-20: Usage output with default empty string
+	t.Run("MIN-20_EmptyDefaultUsage", func(t *testing.T) {
+		type HelpDefCfg struct {
+			Prefix string `confi:"prefix,default='',usage='Path prefix'"`
+			Port   int    `confi:"port,default=8080,usage='Server port'"`
+			Host   string `confi:"host,usage='Server host'"`
+		}
+
+		var cfg HelpDefCfg
+		usageStr, err := Usage(&cfg)
+		if err != nil {
+			t.Fatalf("Usage failed: %v", err)
+		}
+
+		// Check prefix has [default: ""]
+		if !strings.Contains(usageStr, `[default: ""]`) {
+			t.Errorf("expected '[default: \"\"]' for empty default string, got:\n%s", usageStr)
+		}
+		// Check port has [default: 8080]
+		if !strings.Contains(usageStr, "[default: 8080]") {
+			t.Errorf("expected '[default: 8080]' for port, got:\n%s", usageStr)
+		}
+		// Check host does not have default tag
+		for _, line := range strings.Split(usageStr, "\n") {
+			if strings.Contains(line, "--host") && strings.Contains(line, "[default:") {
+				t.Errorf("field without default should not have [default: ...], got line: %s", line)
+			}
+		}
+	})
+
+	// 3. MIN-24: Context-sensitive PowerShell completion
+	t.Run("MIN-24_PowerShellContextSensitivity", func(t *testing.T) {
+		type ServeCmd struct {
+			Port int `confi:"port,short=p,usage='HTTP Port'"`
+		}
+		type MigrateCmd struct {
+			DryRun bool `confi:"dry-run,usage='Dry run migration'"`
+		}
+		type RootApp struct {
+			Verbose bool        `confi:"verbose,usage='Enable verbose output'"`
+			Serve   *ServeCmd   `confi:"serve,subcommand,usage='Start server'"`
+			Migrate *MigrateCmd `confi:"migrate,subcommand,usage='Run migration'"`
+		}
+
+		var app RootApp
+		psScript, err := Completion("powershell", &app, WithName("mycli"))
+		if err != nil {
+			t.Fatalf("PowerShell completion failed: %v", err)
+		}
+
+		// Verify AST elements parsing
+		if !strings.Contains(psScript, "$commandAst.Elements") {
+			t.Errorf("expected AST elements inspection in PowerShell completion, got:\n%s", psScript)
+		}
+
+		// Split PowerShell script by candidates switch block to inspect context-specific candidates
+		switchSubcmd := strings.Index(psScript, "switch ($subcmd)")
+		if switchSubcmd == -1 {
+			t.Fatalf("expected 'switch ($subcmd)' in script:\n%s", psScript)
+		}
+		subcmdBody := psScript[switchSubcmd:]
+		serveIndex := strings.Index(subcmdBody, "'serve' {")
+		migrateIndex := strings.Index(subcmdBody, "'migrate' {")
+		defaultIndex := strings.Index(subcmdBody, "default {")
+
+		if serveIndex == -1 || migrateIndex == -1 || defaultIndex == -1 {
+			t.Fatalf("expected switch branches for 'serve', 'migrate', and default in script:\n%s", psScript)
+		}
+
+		serveSection := subcmdBody[serveIndex:migrateIndex]
+		migrateSection := subcmdBody[migrateIndex:defaultIndex]
+		defaultSection := subcmdBody[defaultIndex:]
+
+		// Serve candidates must contain --port, -p, --verbose, but NOT --dry-run
+		if !strings.Contains(serveSection, "'--port'") || !strings.Contains(serveSection, "'-p'") {
+			t.Errorf("serve candidates missing serve flags: %s", serveSection)
+		}
+		if !strings.Contains(serveSection, "'--verbose'") {
+			t.Errorf("serve candidates missing global flag --verbose: %s", serveSection)
+		}
+		if strings.Contains(serveSection, "'--dry-run'") {
+			t.Errorf("serve candidates should NOT contain flags from migrate (--dry-run): %s", serveSection)
+		}
+
+		// Migrate candidates must contain --dry-run, --verbose, but NOT --port or -p
+		if !strings.Contains(migrateSection, "'--dry-run'") {
+			t.Errorf("migrate candidates missing migrate flags: %s", migrateSection)
+		}
+		if !strings.Contains(migrateSection, "'--verbose'") {
+			t.Errorf("migrate candidates missing global flag --verbose: %s", migrateSection)
+		}
+		if strings.Contains(migrateSection, "'--port'") || strings.Contains(migrateSection, "'-p'") {
+			t.Errorf("migrate candidates should NOT contain flags from serve (--port): %s", migrateSection)
+		}
+
+		// Default candidates must contain subcommand names and global flags
+		if !strings.Contains(defaultSection, "'serve'") || !strings.Contains(defaultSection, "'migrate'") {
+			t.Errorf("default candidates missing subcommands: %s", defaultSection)
+		}
+		if !strings.Contains(defaultSection, "'--verbose'") {
+			t.Errorf("default candidates missing global flags: %s", defaultSection)
+		}
+	})
+
+	// 4. MIN-25: collectFlagTokens appends completionFlag
+	t.Run("MIN-25_CompletionFlagToken", func(t *testing.T) {
+		type AppCfg struct {
+			Env string `confi:"env"`
+		}
+		var cfg AppCfg
+
+		// Bash completion includes --completion when WithCompletionFlag is set
+		bashScript, err := Completion("bash", &cfg, WithName("mycli"), WithCompletionFlag("completion"))
+		if err != nil {
+			t.Fatalf("Bash completion failed: %v", err)
+		}
+		if !strings.Contains(bashScript, "--completion") {
+			t.Errorf("Bash completion script missing --completion flag token:\n%s", bashScript)
+		}
+
+		// PowerShell completion includes '--completion' when WithCompletionFlag is set
+		pwshScript, err := Completion("powershell", &cfg, WithName("mycli"), WithCompletionFlag("completion"))
+		if err != nil {
+			t.Fatalf("PowerShell completion failed: %v", err)
+		}
+		if !strings.Contains(pwshScript, "'--completion'") {
+			t.Errorf("PowerShell completion script missing '--completion' flag token:\n%s", pwshScript)
+		}
+	})
+
+	// 5. MIN-26: App name quoting in Bash, Zsh, and Fish
+	t.Run("MIN-26_AppNameQuoting", func(t *testing.T) {
+		type AppCfg struct {
+			Host string `confi:"host"`
+		}
+		var cfg AppCfg
+
+		for _, appName := range []string{"my-app", "my tool"} {
+			// Bash
+			bash, err := Completion("bash", &cfg, WithName(appName))
+			if err != nil {
+				t.Fatalf("Bash completion failed for %q: %v", appName, err)
+			}
+			expectedBash := fmt.Sprintf("complete -F _%s_completions %q", sanitizeShellIdentifier(appName), appName)
+			if !strings.Contains(bash, expectedBash) {
+				t.Errorf("Bash registration line mismatch for %q: expected %q in:\n%s", appName, expectedBash, bash)
+			}
+
+			// Zsh
+			zsh, err := Completion("zsh", &cfg, WithName(appName))
+			if err != nil {
+				t.Fatalf("Zsh completion failed for %q: %v", appName, err)
+			}
+			expectedZsh := fmt.Sprintf("compdef _%s %q", sanitizeShellIdentifier(appName), appName)
+			if !strings.Contains(zsh, expectedZsh) {
+				t.Errorf("Zsh registration line mismatch for %q: expected %q in:\n%s", appName, expectedZsh, zsh)
+			}
+
+			// Fish
+			fish, err := Completion("fish", &cfg, WithName(appName))
+			if err != nil {
+				t.Fatalf("Fish completion failed for %q: %v", appName, err)
+			}
+			expectedFish := fmt.Sprintf("complete -c %q", appName)
+			if !strings.Contains(fish, expectedFish) {
+				t.Errorf("Fish registration line mismatch for %q: expected %q in:\n%s", appName, expectedFish, fish)
+			}
+		}
+	})
+
+	// 6. MIN-23: Sample generation using populated runtime struct values
+	t.Run("MIN-23_SampleGeneratorRuntimeValues", func(t *testing.T) {
+		type SampleSeedCfg struct {
+			Host    string        `confi:"host"`
+			Port    int           `confi:"port"`
+			Timeout time.Duration `confi:"timeout"`
+			Tags    []string      `confi:"tags"`
+			Secret  string        `confi:"secret,secret"`
+		}
+
+		seed := SampleSeedCfg{
+			Host:    "cluster.internal",
+			Port:    7000,
+			Timeout: 5 * time.Second,
+			Tags:    []string{"web", "prod"},
+			Secret:  "dont-leak-secret",
+		}
+
+		// YAML sample contains populated non-zero values
+		yamlSample, err := GenerateSample(&seed, FormatYAML)
+		if err != nil {
+			t.Fatalf("GenerateSample YAML failed: %v", err)
+		}
+		if !strings.Contains(yamlSample, `host: "cluster.internal"`) {
+			t.Errorf("YAML sample missing populated host:\n%s", yamlSample)
+		}
+		if !strings.Contains(yamlSample, `port: 7000`) {
+			t.Errorf("YAML sample missing populated port:\n%s", yamlSample)
+		}
+		if !strings.Contains(yamlSample, `timeout: "5s"`) {
+			t.Errorf("YAML sample missing populated timeout:\n%s", yamlSample)
+		}
+		if !strings.Contains(yamlSample, `tags: ["web", "prod"]`) {
+			t.Errorf("YAML sample missing populated tags:\n%s", yamlSample)
+		}
+		if strings.Contains(yamlSample, "dont-leak-secret") {
+			t.Errorf("YAML sample leaked secret value:\n%s", yamlSample)
+		}
+
+		// TOML sample contains populated non-zero values
+		tomlSample, err := GenerateSample(&seed, FormatTOML)
+		if err != nil {
+			t.Fatalf("GenerateSample TOML failed: %v", err)
+		}
+		if !strings.Contains(tomlSample, `host = "cluster.internal"`) {
+			t.Errorf("TOML sample missing populated host:\n%s", tomlSample)
+		}
+		if !strings.Contains(tomlSample, `port = 7000`) {
+			t.Errorf("TOML sample missing populated port:\n%s", tomlSample)
+		}
+		if !strings.Contains(tomlSample, `timeout = "5s"`) {
+			t.Errorf("TOML sample missing populated timeout:\n%s", tomlSample)
+		}
+		if !strings.Contains(tomlSample, `tags = ["web", "prod"]`) {
+			t.Errorf("TOML sample missing populated tags:\n%s", tomlSample)
+		}
+		if strings.Contains(tomlSample, "dont-leak-secret") {
+			t.Errorf("TOML sample leaked secret value:\n%s", tomlSample)
+		}
+
+		// JSON sample contains populated non-zero values
+		jsonSample, err := GenerateSample(&seed, FormatJSON)
+		if err != nil {
+			t.Fatalf("GenerateSample JSON failed: %v", err)
+		}
+		if !strings.Contains(jsonSample, `"host": "cluster.internal"`) {
+			t.Errorf("JSON sample missing populated host:\n%s", jsonSample)
+		}
+		if !strings.Contains(jsonSample, `"port": 7000`) {
+			t.Errorf("JSON sample missing populated port:\n%s", jsonSample)
+		}
+		if !strings.Contains(jsonSample, `"timeout": "5s"`) {
+			t.Errorf("JSON sample missing populated timeout:\n%s", jsonSample)
+		}
+		if strings.Contains(jsonSample, "dont-leak-secret") {
+			t.Errorf("JSON sample leaked secret value:\n%s", jsonSample)
+		}
+
+		// Unpopulated struct outputs hardcoded zeros/defaults
+		var empty SampleSeedCfg
+		emptyYAML, err := GenerateSample(&empty, FormatYAML)
+		if err != nil {
+			t.Fatalf("GenerateSample empty YAML failed: %v", err)
+		}
+		if !strings.Contains(emptyYAML, `host: ""`) {
+			t.Errorf("empty YAML sample should have empty host string, got:\n%s", emptyYAML)
+		}
+		if !strings.Contains(emptyYAML, `port: 0`) {
+			t.Errorf("empty YAML sample should have port 0, got:\n%s", emptyYAML)
+		}
+		if !strings.Contains(emptyYAML, `timeout: "0s"`) {
+			t.Errorf("empty YAML sample should have timeout '0s', got:\n%s", emptyYAML)
+		}
+		if !strings.Contains(emptyYAML, `tags: []`) {
+			t.Errorf("empty YAML sample should have empty tags slice, got:\n%s", emptyYAML)
+		}
+	})
+}
+
+func TestComprehensiveRegressionAndEdgeCases(t *testing.T) {
+	// 1. MIN-08: Unicode short flag bundling and non-ASCII runes
+	t.Run("MIN-08_UnicodeRuneShortFlagBundling", func(t *testing.T) {
+		type RuneCfg struct {
+			Verbose bool   `confi:"verbose,short=α"`
+			Quiet   bool   `confi:"quiet,short=β"`
+			Output  string `confi:"output,short=γ"`
+		}
+		var rCfg RuneCfg
+		err := Parse(&rCfg, WithArgs([]string{"-αβ", "-γ=file.txt"}))
+		if err != nil {
+			t.Fatalf("MIN-08 failed: expected unicode short flags to parse cleanly: %v", err)
+		}
+		if !rCfg.Verbose || !rCfg.Quiet || rCfg.Output != "file.txt" {
+			t.Fatalf("MIN-08 failed: expected Verbose=true, Quiet=true, Output='file.txt', got %+v", rCfg)
+		}
+
+		// Single unicode rune short flag
+		var rCfg2 RuneCfg
+		if err := Parse(&rCfg2, WithArgs([]string{"-α"})); err != nil || !rCfg2.Verbose {
+			t.Fatalf("MIN-08 failed on single unicode short flag: %v", err)
+		}
+	})
+
+	// 2. MAJ-06: TOML bracket balancing rejecting negative depth
+	t.Run("MAJ-06_TOMLBracketBalancingNegativeDepth", func(t *testing.T) {
+		if isBalancedBrackets("]") {
+			t.Error("expected isBalancedBrackets to return false for lone closing bracket ']'")
+		}
+		if isBalancedBrackets("][") {
+			t.Error("expected isBalancedBrackets to return false for inverted brackets ']['")
+		}
+		if isBalancedBrackets("[1, 2]]") {
+			t.Error("expected isBalancedBrackets to return false for negative depth '[1, 2]]'")
+		}
+		if !isBalancedBrackets("[ [ 1 ] ]") {
+			t.Error("expected isBalancedBrackets to return true for nested brackets '[ [ 1 ] ]'")
+		}
+		if !isBalancedBrackets(`[ "]" ]`) {
+			t.Error("expected isBalancedBrackets to return true for quoted bracket '[ \"]\" ]'")
+		}
+		if !isBalancedBrackets(`[ '[' ]`) {
+			t.Error("expected isBalancedBrackets to return true for single-quoted bracket")
+		}
+
+		type NegBracketCfg struct {
+			Items []int `confi:"items"`
+		}
+		var negCfg NegBracketCfg
+		err := Parse(&negCfg, WithConfigReader(strings.NewReader("items = ]\n"), FormatTOML), WithArgs(nil))
+		if err == nil {
+			t.Error("expected error for unbalanced bracket 'items = ]'")
+		}
+	})
+
+	// 3. MAJ-27: Watcher modtime check avoiding redundant read
+	t.Run("MAJ-27_WatcherModtimeOptimization", func(t *testing.T) {
+		tmpFile, err := ioutil.TempFile("", "confi_modtime_")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(tmpFile.Name())
+		tmpFile.WriteString("val = 1\n")
+		tmpFile.Close()
+
+		snap1 := takeSnapshots([]string{tmpFile.Name()}, nil)
+		if snap1[tmpFile.Name()].size == 0 || !snap1[tmpFile.Name()].exists {
+			t.Fatalf("expected initial snapshot to exist with non-zero size")
+		}
+
+		// Subsequent snapshot without file modification should reuse previous snapshot struct
+		snap2 := takeSnapshots([]string{tmpFile.Name()}, snap1)
+		if !snap2[tmpFile.Name()].modTime.Equal(snap1[tmpFile.Name()].modTime) {
+			t.Errorf("expected modTime equality")
+		}
+		if snapshotsChanged(snap1, snap2) {
+			t.Errorf("expected snapshotsChanged to be false when modtime and size are identical")
+		}
+	})
+
+	// 4. MIN-01: ParseError Unwrap and formatting
+	t.Run("MIN-01_ParseErrorUnwrap", func(t *testing.T) {
+		inner := errors.New("underlying syntax error")
+		pe := &ParseError{Field: "database.port", Message: "invalid port syntax", Err: inner}
+		if pe.Unwrap() != inner {
+			t.Fatalf("expected Unwrap() to return inner error, got %v", pe.Unwrap())
+		}
+		if !strings.Contains(pe.Error(), "database.port") || !strings.Contains(pe.Error(), "invalid port syntax") {
+			t.Fatalf("unexpected ParseError.Error(): %s", pe.Error())
+		}
+	})
+
+	// 5. INFO-03: Completion error handling
+	t.Run("INFO-03_CompletionErrorHandling", func(t *testing.T) {
+		type CompCfg struct {
+			Host string `confi:"host"`
+		}
+		var buf bytes.Buffer
+		// Unsupported shell
+		if err := WriteCompletion(&buf, "nosuchshell", &CompCfg{}); err == nil {
+			t.Error("expected error for unsupported shell 'nosuchshell'")
+		}
+		// Nil target
+		if err := WriteCompletion(&buf, "bash", nil); err == nil {
+			t.Error("expected error for nil target")
+		}
+		if _, err := Completion("invalid", &CompCfg{}); err == nil {
+			t.Error("expected error for invalid shell in Completion()")
+		}
+	})
+
+	// 6. Format parsers dotted keys and multiline basic strings
+	t.Run("FormatParsers_DottedKeysAndMultiline", func(t *testing.T) {
+		// TOML dotted key with quotes
+		type DottedCfg struct {
+			Data map[string]map[string]string `confi:"data"`
+		}
+		tomlDotted := "data.\"api.v1\".endpoint = \"https://api.local/v1\"\n"
+		var dotCfg DottedCfg
+		if err := Parse(&dotCfg, WithConfigReader(strings.NewReader(tomlDotted), FormatTOML), WithArgs(nil)); err != nil {
+			t.Fatalf("failed to parse TOML dotted key: %v", err)
+		}
+		if dotCfg.Data["api.v1"]["endpoint"] != "https://api.local/v1" {
+			t.Fatalf("unexpected dotted key structure: %+v", dotCfg.Data)
+		}
+
+		// TOML multiline basic string
+		type MultilineBasicCfg struct {
+			Bio string `confi:"bio"`
+		}
+		var mbCfg MultilineBasicCfg
+		tomlMB := "bio = \"\"\"\nFirst line \\u0041\nSecond line \\n third line\n\"\"\"\n"
+		if err := Parse(&mbCfg, WithConfigReader(strings.NewReader(tomlMB), FormatTOML), WithArgs(nil)); err != nil {
+			t.Fatalf("failed to parse TOML basic multiline string: %v", err)
+		}
+		if !strings.Contains(mbCfg.Bio, "First line A") || !strings.Contains(mbCfg.Bio, "Second line \n third line") {
+			t.Fatalf("unexpected multiline basic string content: %q", mbCfg.Bio)
+		}
+
+		// DotEnv variable expansion fallback ${VAR:-default}
+		dotEnvContent := "DEFINED=hello\nEXP1=${DEFINED:-fallback}\nEXP2=${UNDEFINED_999:-fallback_val}\nEXP3=${UNDEFINED_888:-raw_fallback}\n"
+		envMap, err := parseDotEnv(strings.NewReader(dotEnvContent), os.LookupEnv)
+		if err != nil {
+			t.Fatalf("failed to parse .env fallbacks: %v", err)
+		}
+		if envMap["EXP1"] != "hello" || envMap["EXP2"] != "fallback_val" || envMap["EXP3"] != "raw_fallback" {
+			t.Fatalf("unexpected .env expansions: %+v", envMap)
+		}
+	})
+
+	// 7. Validation: multi-type oneOf, string/slice min/max length, and pattern constraints
+	t.Run("Validation_MultiTypeOneOfAndRegexp", func(t *testing.T) {
+		type ConstraintsCfg struct {
+			IntOneOf   int           `confi:"int-one-of,oneof='10|20|30'"`
+			FloatOneOf float64       `confi:"float-one-of,oneof='1.5|2.5'"`
+			DurOneOf   time.Duration `confi:"dur-one-of,oneof='100ms|500ms|1s'"`
+			Code       string        `confi:"code,pattern='^[A-Z]{3}-[0-9]{3}$'"`
+			ShortStr   string        `confi:"short-str,min=2,max=5"`
+		}
+		var validC ConstraintsCfg
+		err := Parse(&validC, WithArgs([]string{
+			"--int-one-of=20",
+			"--float-one-of=2.5",
+			"--dur-one-of=500ms",
+			"--code=ABC-123",
+			"--short-str=hello",
+		}))
+		if err != nil {
+			t.Fatalf("expected valid constraints to pass, got: %v", err)
+		}
+
+		// Test violations
+		var invalidInt ConstraintsCfg
+		if err := Parse(&invalidInt, WithArgs([]string{"--int-one-of=99"})); err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected int oneOf error, got: %v", err)
+		}
+
+		var invalidFloat ConstraintsCfg
+		if err := Parse(&invalidFloat, WithArgs([]string{"--float-one-of=9.9"})); err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected float oneOf error, got: %v", err)
+		}
+
+		var invalidDur ConstraintsCfg
+		if err := Parse(&invalidDur, WithArgs([]string{"--dur-one-of=2s"})); err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected dur oneOf error, got: %v", err)
+		}
+
+		var invalidRegex ConstraintsCfg
+		if err := Parse(&invalidRegex, WithArgs([]string{"--code=invalid-code"})); err == nil || !strings.Contains(err.Error(), "does not match pattern") {
+			t.Fatalf("expected pattern error, got: %v", err)
+		}
+
+		var invalidLenMax ConstraintsCfg
+		if err := Parse(&invalidLenMax, WithArgs([]string{"--short-str=too-long-string"})); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+			t.Fatalf("expected max length error, got: %v", err)
+		}
+
+		var invalidLenMin ConstraintsCfg
+		if err := Parse(&invalidLenMin, WithArgs([]string{"--short-str=a"})); err == nil || !strings.Contains(err.Error(), "less than minimum") {
+			t.Fatalf("expected min length error, got: %v", err)
+		}
+	})
+
+	// 8. CLI flags terminator and negation
+	t.Run("CLI_FlagsTerminatorAndNegation", func(t *testing.T) {
+		type TermCfg struct {
+			Enabled bool   `confi:"enabled"`
+			Verbose bool   `confi:"verbose"`
+			File1   string `confi:"file1,pos"`
+			File2   string `confi:"file2,pos"`
+		}
+		var tCfg TermCfg
+		err := Parse(&tCfg, WithArgs([]string{"--enabled", "--verbose", "--no-verbose", "--", "--not-a-flag", "-file2"}))
+		if err != nil {
+			t.Fatalf("Parse with terminator failed: %v", err)
+		}
+		if !tCfg.Enabled || tCfg.Verbose || tCfg.File1 != "--not-a-flag" || tCfg.File2 != "-file2" {
+			t.Fatalf("unexpected terminator result: %+v", tCfg)
+		}
+	})
+
+	// 9. Scalar interface conversion in config loader
+	t.Run("ScalarInterfaceConversionInConfig", func(t *testing.T) {
+		type ScalarConvCfg struct {
+			IntStr   string `confi:"int_str"`
+			FloatStr string `confi:"float_str"`
+			BoolStr  string `confi:"bool_str"`
+			Role     customRole `confi:"role"`
+		}
+		jsonData := `{"int_str": 42, "float_str": 3.1415, "bool_str": true, "role": "editor"}`
+		var sCfg ScalarConvCfg
+		if err := Parse(&sCfg, WithConfigReader(strings.NewReader(jsonData), FormatJSON), WithArgs(nil)); err != nil {
+			t.Fatalf("JSON scalar conversion failed: %v", err)
+		}
+		if sCfg.IntStr != "42" || sCfg.FloatStr != "3.1415" || sCfg.BoolStr != "true" || sCfg.Role.Name != "role:EDITOR" {
+			t.Fatalf("unexpected scalar conversions: %+v", sCfg)
+		}
+	})
+
+	// 10. TOML array of tables with rich fields
+	t.Run("TOMLTableUnderArrayOfTables", func(t *testing.T) {
+		type Server struct {
+			Name    string `confi:"name"`
+			Port    int    `confi:"port"`
+			Enabled bool   `confi:"enabled"`
+		}
+		type Topology struct {
+			Servers []Server `confi:"servers"`
+		}
+		tomlData := `
+[[servers]]
+name = "alpha"
+port = 8001
+enabled = true
+
+[[servers]]
+name = "beta"
+port = 8002
+enabled = false
+`
+		var top Topology
+		if err := Parse(&top, WithConfigReader(strings.NewReader(tomlData), FormatTOML), WithArgs(nil)); err != nil {
+			t.Fatalf("TOML array of tables failed: %v", err)
+		}
+		if len(top.Servers) != 2 || top.Servers[0].Name != "alpha" || top.Servers[1].Name != "beta" {
+			t.Fatalf("unexpected server names: %+v", top.Servers)
+		}
+		if top.Servers[0].Port != 8001 || !top.Servers[0].Enabled || top.Servers[1].Port != 8002 || top.Servers[1].Enabled {
+			t.Fatalf("unexpected server fields: %+v", top.Servers)
+		}
+	})
+
+	// 11. OneOf boolean and unsigned integer validation
+	t.Run("OneOfBooleanAndUnsignedInts", func(t *testing.T) {
+		type BoolUintOneOf struct {
+			Choice bool   `confi:"choice,oneof='true'"`
+			Size   uint64 `confi:"size,oneof='1024|2048|4096'"`
+		}
+		var bu BoolUintOneOf
+		if err := Parse(&bu, WithArgs([]string{"--choice=true", "--size=2048"})); err != nil {
+			t.Fatalf("expected valid choice and size to pass, got: %v", err)
+		}
+
+		var invalidSize BoolUintOneOf
+		if err := Parse(&invalidSize, WithArgs([]string{"--choice=true", "--size=9999"})); err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected oneOf error on uint64, got: %v", err)
+		}
+
+		var invalidBool BoolUintOneOf
+		if err := Parse(&invalidBool, WithArgs([]string{"--choice=false"})); err == nil || !strings.Contains(err.Error(), "must be one of") {
+			t.Fatalf("expected oneOf error on bool, got: %v", err)
+		}
+	})
+
+	// 12. Watcher deep copy complex pointer and interface structures
+	t.Run("WatcherDeepCopyComplexStructures", func(t *testing.T) {
+		type InnerData struct {
+			Count int
+			Tags  []string
+		}
+		type OuterData struct {
+			PtrInner *InnerData
+			MapData  map[string]string
+		}
+
+		orig := OuterData{
+			PtrInner: &InnerData{Count: 42, Tags: []string{"a", "b"}},
+			MapData:  map[string]string{"k1": "v1"},
+		}
+
+		copyVal := deepCopyValue(reflect.ValueOf(orig))
+		copied, ok := copyVal.Interface().(OuterData)
+		if !ok {
+			t.Fatalf("deepCopyValue type mismatch")
+		}
+
+		// Mutate original
+		orig.PtrInner.Count = 100
+		orig.PtrInner.Tags[0] = "mutated"
+		orig.MapData["k1"] = "mutated"
+
+		// Copied must be unaffected
+		if copied.PtrInner.Count != 42 || copied.PtrInner.Tags[0] != "a" || copied.MapData["k1"] != "v1" {
+			t.Fatalf("deepCopyValue was not a true deep copy: %+v", copied)
+		}
+	})
+}
+
+type e2eServeCmd struct {
+	Port     int    `confi:"port,default=8080"`
+	Host     string `confi:"host,default=0.0.0.0"`
+	executed bool
+}
+
+func (s *e2eServeCmd) Run() error {
+	s.executed = true
+	return nil
+}
+
+type e2eMigrateCmd struct {
+	ConfigFile string `confi:"config,config"`
+	Steps      int    `confi:"steps,default=1"`
+	executed   bool
+}
+
+func (m *e2eMigrateCmd) Run() error {
+	m.executed = true
+	return nil
+}
+
+func TestEndToEndIntegration(t *testing.T) {
+	// 1. Full Precedence, Live Reload, Redaction, and Shell Completion Lifecycle
+	t.Run("PrecedenceAndLiveReloadIntegration", func(t *testing.T) {
+		tmpDir, err := ioutil.TempDir("", "confi_e2e_")
+		if err != nil {
+			t.Fatalf("TempDir failed: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		cfgPath := filepath.Join(tmpDir, "app.yaml")
+		yamlContent := `
+host: "config.local"
+port: 7000
+secret_key: "yaml-super-secret"
+`
+		if err := ioutil.WriteFile(cfgPath, []byte(yamlContent), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		type E2EAppConfig struct {
+			Host       string            `confi:"host,min=3,default='default.local'"`
+			Port       int               `confi:"port,min=1024,max=65535,default=3000"`
+			SecretKey  string            `confi:"secret_key,secret"`
+			Workers    int               // Programmatic default (no tag)
+			Labels     map[string]string `confi:"labels"`
+			ConfigFile string            `confi:"config,config"`
+		}
+
+		app := E2EAppConfig{
+			Workers: 8, // programmatic default
+		}
+
+		// Environment variable overrides config file and struct default
+		os.Setenv("E2E_HOST", "env.override.local")
+		defer os.Unsetenv("E2E_HOST")
+
+		// CLI flag overrides env, config file, and struct default
+		cliArgs := []string{"--port=9999", "--labels", "region=us-west,env=prod"}
+
+		reloadCh := make(chan error, 2)
+		watcher, err := Watch(
+			&app,
+			func(e error) {
+				reloadCh <- e
+			},
+			WithConfigFile(cfgPath),
+			WithConfigFlag("config"),
+			WithEnvPrefix("E2E"),
+			WithAutoEnv(true),
+			WithArgs(cliArgs),
+			WithWatchInterval(15*time.Millisecond),
+		)
+		if err != nil {
+			t.Fatalf("Watch failed: %v", err)
+		}
+		defer watcher.Close()
+
+		// Verify precedence:
+		// Port: CLI (9999) > Config (7000) > Default (3000)
+		if app.Port != 9999 {
+			t.Errorf("precedence failure for Port: expected 9999 from CLI, got %d", app.Port)
+		}
+		// Host: Env (env.override.local) > Config (config.local) > Default (default.local)
+		if app.Host != "env.override.local" {
+			t.Errorf("precedence failure for Host: expected env.override.local, got %q", app.Host)
+		}
+		// SecretKey: from Config ("yaml-super-secret")
+		if app.SecretKey != "yaml-super-secret" {
+			t.Errorf("SecretKey failure: expected yaml-super-secret, got %q", app.SecretKey)
+		}
+		// Programmatic default: preserved!
+		if app.Workers != 8 {
+			t.Errorf("Programmatic default failure: expected Workers=8, got %d", app.Workers)
+		}
+		// Labels map
+		if app.Labels["region"] != "us-west" || app.Labels["env"] != "prod" {
+			t.Errorf("Labels mismatch: %+v", app.Labels)
+		}
+
+		// Generate sample YAML and verify secret value is not leaked
+		sampleYAML, err := GenerateSample(&app, FormatYAML)
+		if err != nil {
+			t.Fatalf("GenerateSample failed: %v", err)
+		}
+		if strings.Contains(sampleYAML, "yaml-super-secret") {
+			t.Errorf("SecretKey was leaked in YAML sample:\n%s", sampleYAML)
+		}
+		if !strings.Contains(sampleYAML, `secret_key: ""`) {
+			t.Errorf("Expected secret_key: \"\" in YAML sample:\n%s", sampleYAML)
+		}
+
+		// Dump masks secrets with ********
+		dumpStr, err := Dump(&app)
+		if err != nil {
+			t.Fatalf("Dump failed: %v", err)
+		}
+		if strings.Contains(dumpStr, "yaml-super-secret") {
+			t.Errorf("SecretKey was leaked in Dump:\n%s", dumpStr)
+		}
+		if !strings.Contains(dumpStr, "secret-key = ********") && !strings.Contains(dumpStr, "secret_key = ********") {
+			t.Errorf("Expected secret key masked with ******** in Dump, got:\n%s", dumpStr)
+		}
+
+		// Generate completions for all supported shells
+		for _, shell := range []string{"bash", "zsh", "fish", "powershell"} {
+			script, err := Completion(shell, &app, WithName("e2eapp"))
+			if err != nil {
+				t.Fatalf("Completion failed for %s: %v", shell, err)
+			}
+			if len(script) == 0 {
+				t.Fatalf("empty completion script for %s", shell)
+			}
+		}
+
+		// Mutate config on disk
+		time.Sleep(30 * time.Millisecond)
+		updatedYaml := `
+host: "config.local"
+port: 7000
+secret_key: "updated-secret"
+`
+		if err := ioutil.WriteFile(cfgPath, []byte(updatedYaml), 0600); err != nil {
+			t.Fatalf("WriteFile update failed: %v", err)
+		}
+
+		select {
+		case rErr := <-reloadCh:
+			if rErr != nil {
+				t.Fatalf("reload returned error: %v", rErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for watcher reload")
+		}
+
+		watcher.RLock()
+		if app.SecretKey != "updated-secret" {
+			t.Errorf("expected updated SecretKey 'updated-secret', got %q", app.SecretKey)
+		}
+		if app.Workers != 8 {
+			t.Errorf("expected Workers=8 to be preserved after reload, got %d", app.Workers)
+		}
+		watcher.RUnlock()
+	})
+
+	// 2. Subcommands, Runners, Dynamic Subcommand Config Files, and Usage
+	t.Run("SubcommandsEndToEndIntegration", func(t *testing.T) {
+		tmpDir, err := ioutil.TempDir("", "confi_e2e_sub_")
+		if err != nil {
+			t.Fatalf("TempDir failed: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		migrateCfgFile := filepath.Join(tmpDir, "migrate.json")
+		if err := ioutil.WriteFile(migrateCfgFile, []byte(`{"steps": 5}`), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		type RootApp struct {
+			Verbose bool          `confi:"verbose,usage='Enable verbose output'"`
+			Serve   e2eServeCmd   `confi:"serve,subcommand,usage='Start API server'"`
+			Migrate e2eMigrateCmd `confi:"migrate,subcommand,usage='Run database migrations'"`
+		}
+
+		// Test 1: SubcommandUsage formatting
+		var root RootApp
+		usageStr, err := SubcommandUsage(&root, "serve", WithName("myapp"))
+		if err != nil {
+			t.Fatalf("SubcommandUsage failed: %v", err)
+		}
+		if !strings.Contains(usageStr, "Usage: myapp serve [flags]") || !strings.Contains(usageStr, "--port") {
+			t.Fatalf("unexpected SubcommandUsage output:\n%s", usageStr)
+		}
+
+		// Test 2: Subcommand execution via RunCommand
+		var root2 RootApp
+		p := NewParser("myapp", WithArgs([]string{"serve", "--port=9090"}))
+		if err := p.Parse(&root2); err != nil {
+			t.Fatalf("Parse serve subcommand failed: %v", err)
+		}
+		if root2.Serve.Port != 9090 {
+			t.Fatalf("expected Serve.Port 9090, got %d", root2.Serve.Port)
+		}
+		if err := p.RunCommand(&root2); err != nil {
+			t.Fatalf("RunCommand failed: %v", err)
+		}
+		if !root2.Serve.executed {
+			t.Fatal("expected serve.Run() to be executed")
+		}
+
+		// Test 3: Subcommand with dynamic config file
+		var root3 RootApp
+		p2 := NewParser("myapp", WithArgs([]string{"migrate", "--config", migrateCfgFile}))
+		if err := p2.Parse(&root3); err != nil {
+			t.Fatalf("Parse migrate subcommand with dynamic config failed: %v", err)
+		}
+		if root3.Migrate.Steps != 5 {
+			t.Fatalf("expected Migrate.Steps=5 from JSON config, got %d", root3.Migrate.Steps)
+		}
+		if err := p2.RunCommand(&root3); err != nil {
+			t.Fatalf("RunCommand failed: %v", err)
+		}
+		if !root3.Migrate.executed {
+			t.Fatal("expected migrate.Run() to be executed")
+		}
+	})
+
+	// 3. Cyclic structs with custom validation and schema extraction
+	t.Run("CyclicAndComplexTypesIntegration", func(t *testing.T) {
+		type RecursiveNode struct {
+			Name  string         `confi:"name"`
+			Child *RecursiveNode `confi:"child"`
+		}
+
+		var root RecursiveNode
+		// Verify schema extraction and ParseArgs handles self-referencing types cleanly
+		if err := Parse(&root, WithArgs([]string{"--name=root"})); err != nil {
+			t.Fatalf("Parse on self-referential struct failed: %v", err)
+		}
+		if root.Name != "root" {
+			t.Errorf("expected root.Name 'root', got %q", root.Name)
+		}
+
+		// Verify usage string generation does not loop infinitely
+		usageStr, err := Usage(&root, WithName("cyclicapp"))
+		if err != nil {
+			t.Fatalf("Usage failed on cyclic struct: %v", err)
+		}
+		if !strings.Contains(usageStr, "--name") {
+			t.Fatalf("Usage missing --name:\n%s", usageStr)
+		}
+
+		// Verify custom validator terminates cleanly on cyclic reference
+		n1 := &RecursiveNode{Name: "n1"}
+		n2 := &RecursiveNode{Name: "n2", Child: n1}
+		n1.Child = n2
+		if err := invokeCustomValidators(reflect.ValueOf(n1)); err != nil {
+			t.Fatalf("invokeCustomValidators failed on cyclic pointers: %v", err)
+		}
+	})
+}

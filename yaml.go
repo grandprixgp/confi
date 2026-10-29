@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
+
+const maxYAMLDepth = 100
 
 type yamlLine struct {
 	lineNum int
@@ -28,7 +31,13 @@ func parseYAML(r io.Reader) (map[string]interface{}, error) {
 	var lines []yamlLine
 	for idx, raw := range rawLines {
 		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") || trimmed == "---" || trimmed == "..." {
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if trimmed == "---" || trimmed == "..." {
+			if len(lines) > 0 {
+				return nil, fmt.Errorf("yaml line %d: multi-document streams are not supported in config loader", idx+1)
+			}
 			continue
 		}
 		indent := countIndent(raw)
@@ -50,7 +59,11 @@ func parseYAML(r io.Reader) (map[string]interface{}, error) {
 		return make(map[string]interface{}), nil
 	}
 
-	res, _, err := parseYAMLMapping(lines, 0, lines[0].indent, rawLines)
+	if strings.HasPrefix(lines[0].content, "- ") || lines[0].content == "-" || (strings.HasPrefix(lines[0].content, "[") && strings.HasSuffix(lines[0].content, "]")) {
+		return nil, fmt.Errorf("yaml line %d: root document must be a mapping, got sequence", lines[0].lineNum)
+	}
+
+	res, _, err := parseYAMLMapping(lines, 0, lines[0].indent, rawLines, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +135,14 @@ func stripYAMLComment(s string) string {
 	return s
 }
 
-func parseYAMLMapping(lines []yamlLine, startIdx int, baseIndent int, rawLines []string) (map[string]interface{}, int, error) {
+func parseYAMLMapping(lines []yamlLine, startIdx int, baseIndent int, rawLines []string, depth int) (map[string]interface{}, int, error) {
+	if depth > maxYAMLDepth {
+		lineNum := 1
+		if startIdx < len(lines) {
+			lineNum = lines[startIdx].lineNum
+		}
+		return nil, startIdx, fmt.Errorf("yaml line %d: maximum nesting depth (%d) exceeded", lineNum, maxYAMLDepth)
+	}
 	result := make(map[string]interface{})
 	i := startIdx
 
@@ -166,14 +186,14 @@ func parseYAMLMapping(lines []yamlLine, startIdx int, baseIndent int, rawLines [
 			// Allow sequence at same indent or deeper indent
 			if (nextLn.indent > ln.indent) || (nextLn.indent == ln.indent && (strings.HasPrefix(nextLn.content, "- ") || nextLn.content == "-")) {
 				if strings.HasPrefix(nextLn.content, "- ") || nextLn.content == "-" {
-					seq, nextI, err := parseYAMLSequence(lines, i, nextLn.indent, rawLines)
+					seq, nextI, err := parseYAMLSequence(lines, i, nextLn.indent, rawLines, depth+1)
 					if err != nil {
 						return nil, nextI, err
 					}
 					result[key] = seq
 					i = nextI
 				} else {
-					subMap, nextI, err := parseYAMLMapping(lines, i, nextLn.indent, rawLines)
+					subMap, nextI, err := parseYAMLMapping(lines, i, nextLn.indent, rawLines, depth+1)
 					if err != nil {
 						return nil, nextI, err
 					}
@@ -186,7 +206,7 @@ func parseYAMLMapping(lines []yamlLine, startIdx int, baseIndent int, rawLines [
 			continue
 		}
 
-		val, err := parseYAMLInlineValue(valPart, ln.lineNum)
+		val, err := parseYAMLInlineValue(valPart, ln.lineNum, depth+1)
 		if err != nil {
 			return nil, i, err
 		}
@@ -197,7 +217,14 @@ func parseYAMLMapping(lines []yamlLine, startIdx int, baseIndent int, rawLines [
 	return result, i, nil
 }
 
-func parseYAMLSequence(lines []yamlLine, startIdx int, seqIndent int, rawLines []string) ([]interface{}, int, error) {
+func parseYAMLSequence(lines []yamlLine, startIdx int, seqIndent int, rawLines []string, depth int) ([]interface{}, int, error) {
+	if depth > maxYAMLDepth {
+		lineNum := 1
+		if startIdx < len(lines) {
+			lineNum = lines[startIdx].lineNum
+		}
+		return nil, startIdx, fmt.Errorf("yaml line %d: maximum nesting depth (%d) exceeded", lineNum, maxYAMLDepth)
+	}
 	var seq []interface{}
 	i := startIdx
 
@@ -219,7 +246,7 @@ func parseYAMLSequence(lines []yamlLine, startIdx int, seqIndent int, rawLines [
 			i++
 			if i < len(lines) && lines[i].indent > seqIndent {
 				if strings.HasPrefix(lines[i].content, "- ") || lines[i].content == "-" {
-					nestedSeq, nextI, err := parseYAMLSequence(lines, i, lines[i].indent, rawLines)
+					nestedSeq, nextI, err := parseYAMLSequence(lines, i, lines[i].indent, rawLines, depth+1)
 					if err != nil {
 						return nil, nextI, err
 					}
@@ -227,7 +254,7 @@ func parseYAMLSequence(lines []yamlLine, startIdx int, seqIndent int, rawLines [
 					i = nextI
 					continue
 				}
-				subMap, nextI, err := parseYAMLMapping(lines, i, lines[i].indent, rawLines)
+				subMap, nextI, err := parseYAMLMapping(lines, i, lines[i].indent, rawLines, depth+1)
 				if err != nil {
 					return nil, nextI, err
 				}
@@ -244,29 +271,49 @@ func parseYAMLSequence(lines []yamlLine, startIdx int, seqIndent int, rawLines [
 			itemMap := make(map[string]interface{})
 			k = unquoteYAMLScalar(k)
 			vPart = strings.TrimSpace(vPart)
+			i++
 			if vPart != "" {
-				parsedV, err := parseYAMLInlineValue(vPart, ln.lineNum)
+				parsedV, err := parseYAMLInlineValue(vPart, ln.lineNum, depth+1)
 				if err != nil {
 					return nil, i, err
 				}
 				itemMap[k] = parsedV
+			} else if i < len(lines) && lines[i].indent > seqIndent {
+				if strings.HasPrefix(lines[i].content, "- ") || lines[i].content == "-" {
+					nestedSeq, nextI, err := parseYAMLSequence(lines, i, lines[i].indent, rawLines, depth+1)
+					if err != nil {
+						return nil, nextI, err
+					}
+					itemMap[k] = nestedSeq
+					i = nextI
+				} else {
+					nestedMap, nextI, err := parseYAMLMapping(lines, i, lines[i].indent, rawLines, depth+1)
+					if err != nil {
+						return nil, nextI, err
+					}
+					itemMap[k] = nestedMap
+					i = nextI
+				}
+			} else {
+				itemMap[k] = ""
 			}
-			i++
 			if i < len(lines) && lines[i].indent > seqIndent {
-				moreMap, nextI, err := parseYAMLMapping(lines, i, lines[i].indent, rawLines)
-				if err != nil {
-					return nil, nextI, err
+				if !strings.HasPrefix(lines[i].content, "- ") && lines[i].content != "-" {
+					moreMap, nextI, err := parseYAMLMapping(lines, i, lines[i].indent, rawLines, depth+1)
+					if err != nil {
+						return nil, nextI, err
+					}
+					for mk, mv := range moreMap {
+						itemMap[mk] = mv
+					}
+					i = nextI
 				}
-				for mk, mv := range moreMap {
-					itemMap[mk] = mv
-				}
-				i = nextI
 			}
 			seq = append(seq, itemMap)
 			continue
 		}
 
-		val, err := parseYAMLInlineValue(itemText, ln.lineNum)
+		val, err := parseYAMLInlineValue(itemText, ln.lineNum, depth+1)
 		if err != nil {
 			return nil, i, err
 		}
@@ -355,7 +402,10 @@ func splitYAMLKeyValue(s string) (string, string, bool) {
 	return "", "", false
 }
 
-func parseYAMLInlineValue(s string, lineNum int) (interface{}, error) {
+func parseYAMLInlineValue(s string, lineNum int, depth int) (interface{}, error) {
+	if depth > maxYAMLDepth {
+		return nil, fmt.Errorf("yaml line %d: maximum nesting depth (%d) exceeded", lineNum, maxYAMLDepth)
+	}
 	s = strings.TrimSpace(s)
 	if s == "" || s == "~" || strings.EqualFold(s, "null") {
 		return nil, nil
@@ -370,7 +420,7 @@ func parseYAMLInlineValue(s string, lineNum int) (interface{}, error) {
 		parts := splitFlowItems(inner)
 		items := make([]interface{}, 0, len(parts))
 		for _, p := range parts {
-			v, err := parseYAMLInlineValue(p, lineNum)
+			v, err := parseYAMLInlineValue(p, lineNum, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -392,7 +442,7 @@ func parseYAMLInlineValue(s string, lineNum int) (interface{}, error) {
 			if !ok {
 				return nil, fmt.Errorf("yaml line %d: invalid flow mapping entry %q", lineNum, p)
 			}
-			v, err := parseYAMLInlineValue(vPart, lineNum)
+			v, err := parseYAMLInlineValue(vPart, lineNum, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -452,7 +502,93 @@ func isQuotedYAML(s string) bool {
 	if len(s) < 2 {
 		return false
 	}
-	return (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')
+	q := s[0]
+	if q != '"' && q != '\'' {
+		return false
+	}
+	if q == '\'' {
+		for i := 1; i < len(s); i++ {
+			if s[i] == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				return i == len(s)-1
+			}
+		}
+		return false
+	}
+	escaped := false
+	for i := 1; i < len(s); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if s[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if s[i] == '"' {
+			return i == len(s)-1
+		}
+	}
+	return false
+}
+
+func unescapeStringEscapes(s string) string {
+	var buf strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			switch s[i] {
+			case 'b':
+				buf.WriteByte('\b')
+			case 'f':
+				buf.WriteByte('\f')
+			case 'n':
+				buf.WriteByte('\n')
+			case 'r':
+				buf.WriteByte('\r')
+			case 't':
+				buf.WriteByte('\t')
+			case '"':
+				buf.WriteByte('"')
+			case '\\':
+				buf.WriteByte('\\')
+			case '/':
+				buf.WriteByte('/')
+			case '0':
+				buf.WriteByte(0)
+			case 'u':
+				if i+4 < len(s) {
+					hexStr := s[i+1 : i+5]
+					val, err := strconv.ParseUint(hexStr, 16, 32)
+					if err == nil {
+						buf.WriteRune(rune(val))
+						i += 4
+						continue
+					}
+				}
+				buf.WriteByte('u')
+			case 'U':
+				if i+8 < len(s) {
+					hexStr := s[i+1 : i+9]
+					val, err := strconv.ParseUint(hexStr, 16, 32)
+					if err == nil {
+						buf.WriteRune(rune(val))
+						i += 8
+						continue
+					}
+				}
+				buf.WriteByte('U')
+			default:
+				buf.WriteByte(s[i])
+			}
+			continue
+		}
+		buf.WriteByte(s[i])
+	}
+	return buf.String()
 }
 
 func unquoteYAMLScalar(s string) string {
@@ -461,30 +597,7 @@ func unquoteYAMLScalar(s string) string {
 		return strings.ReplaceAll(s[1:len(s)-1], "''", "'")
 	}
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		inner := s[1 : len(s)-1]
-		var buf strings.Builder
-		for i := 0; i < len(inner); i++ {
-			if inner[i] == '\\' && i+1 < len(inner) {
-				i++
-				switch inner[i] {
-				case 'n':
-					buf.WriteByte('\n')
-				case 'r':
-					buf.WriteByte('\r')
-				case 't':
-					buf.WriteByte('\t')
-				case '"':
-					buf.WriteByte('"')
-				case '\\':
-					buf.WriteByte('\\')
-				default:
-					buf.WriteByte(inner[i])
-				}
-				continue
-			}
-			buf.WriteByte(inner[i])
-		}
-		return buf.String()
+		return unescapeStringEscapes(s[1 : len(s)-1])
 	}
 	return s
 }

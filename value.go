@@ -80,14 +80,10 @@ func assignFromStrings(fv reflect.Value, raws []string, sep string, appendMode b
 	switch t.Kind() {
 	case reflect.Slice:
 		var items []string
-		_ = t.Elem().Kind()
 		for _, r := range raws {
 			if sep != "" && strings.Contains(r, sep) {
-				// For non-string slices, or single-token comma-lists without spaces, split by sep.
-				if true {
-					items = append(items, splitBySeparator(r, sep)...)
-					continue
-				}
+				items = append(items, splitBySeparator(r, sep)...)
+				continue
 			}
 			items = append(items, r)
 		}
@@ -407,6 +403,9 @@ func parseTimeValue(raw string) (time.Time, error) {
 }
 
 func isBoolValue(v reflect.Value) bool {
+	if !v.IsValid() {
+		return false
+	}
 	t := v.Type()
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
@@ -443,10 +442,17 @@ func isZeroValue(v reflect.Value) bool {
 		return true
 	case reflect.Struct:
 		if v.Type() == timeType {
-			return v.Interface().(time.Time).IsZero()
+			if v.CanInterface() {
+				return v.Interface().(time.Time).IsZero()
+			}
+			return true
 		}
-		z := reflect.Zero(v.Type()).Interface()
-		return reflect.DeepEqual(v.Interface(), z)
+		for i := 0; i < v.NumField(); i++ {
+			if !isZeroValue(v.Field(i)) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}

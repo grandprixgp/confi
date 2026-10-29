@@ -50,9 +50,7 @@ func WithDescription(description string) Option {
 // WithPrefix sets the long CLI flag prefix (defaults to "--").
 func WithPrefix(prefix string) Option {
 	return func(p *Parser) {
-		if prefix != "" {
-			p.prefix = prefix
-		}
+		p.prefix = prefix
 	}
 }
 
@@ -80,12 +78,17 @@ func WithEnvPrefix(prefix string) Option {
 	}
 }
 
-// WithAutoEnv enables automatic environment variable lookup for all struct fields
+// WithAutoEnv enables or disables automatic environment variable lookup for all struct fields
 // using their UPPER_SNAKE_CASE path (with EnvPrefix prepended if configured),
 // even when no explicit `env` struct tag is present.
-func WithAutoEnv() Option {
+// If called without arguments, it defaults to true for backward compatibility.
+func WithAutoEnv(enabled ...bool) Option {
 	return func(p *Parser) {
-		p.autoEnv = true
+		if len(enabled) == 0 || enabled[0] {
+			p.autoEnv = true
+		} else {
+			p.autoEnv = false
+		}
 	}
 }
 

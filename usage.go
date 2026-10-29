@@ -38,6 +38,40 @@ func (p *Parser) WriteUsage(w io.Writer, target interface{}) error {
 	return p.writeSchemaUsage(w, schema, "", p.description)
 }
 
+// SubcommandUsage returns the formatted help/usage message for a specific subcommand of target.
+func SubcommandUsage(target interface{}, subcmd string, opts ...Option) (string, error) {
+	p := NewParser("", opts...)
+	return p.SubcommandUsage(target, subcmd)
+}
+
+// WriteSubcommandUsage writes the formatted help/usage message for a specific subcommand of target to w.
+func WriteSubcommandUsage(w io.Writer, target interface{}, subcmd string, opts ...Option) error {
+	p := NewParser("", opts...)
+	return p.WriteSubcommandUsage(w, target, subcmd)
+}
+
+// SubcommandUsage returns the formatted help/usage message for a specific subcommand of target using this Parser's settings.
+func (p *Parser) SubcommandUsage(target interface{}, subcmd string) (string, error) {
+	var buf bytes.Buffer
+	if err := p.WriteSubcommandUsage(&buf, target, subcmd); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// WriteSubcommandUsage writes the formatted help/usage message for a specific subcommand of target to w using this Parser's settings.
+func (p *Parser) WriteSubcommandUsage(w io.Writer, target interface{}, subcmd string) error {
+	schema, _, err := extractSchema(target)
+	if err != nil {
+		return err
+	}
+	subMeta, ok := schema.subcommands[strings.ToLower(strings.TrimSpace(subcmd))]
+	if !ok {
+		return &ParseError{Message: fmt.Sprintf("unknown subcommand %q", subcmd)}
+	}
+	return p.writeSchemaUsage(w, subMeta.schema, subMeta.name, subMeta.usage)
+}
+
 func (p *Parser) writeSchemaUsage(w io.Writer, schema *structSchema, subcmdName string, description string) error {
 	appName := p.name
 	if appName == "" {
@@ -205,8 +239,12 @@ func (p *Parser) formatFieldDetails(meta *fieldMeta) string {
 	if len(meta.oneOf) > 0 {
 		parts = append(parts, fmt.Sprintf("[choices: %s]", strings.Join(meta.oneOf, "|")))
 	}
-	if meta.hasDefault && meta.defaultValue != "" {
-		parts = append(parts, fmt.Sprintf("[default: %s]", meta.defaultValue))
+	if meta.hasDefault {
+		if meta.defaultValue == "" {
+			parts = append(parts, `[default: ""]`)
+		} else {
+			parts = append(parts, fmt.Sprintf("[default: %s]", meta.defaultValue))
+		}
 	}
 	envName := p.displayEnvName(meta)
 	if envName != "" {

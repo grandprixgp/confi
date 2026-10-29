@@ -189,15 +189,7 @@ func (p *Parser) RunCommand(target interface{}) error {
 		}
 		return nil
 	}
-	/*
-				if r, ok := extractRunner(subVal); ok {
-					return r.Run()
-				}
-			}
-		}
-	}
 
-	*/
 	if r, ok := extractRunner(rootVal); ok {
 		return r.Run()
 	}
@@ -270,10 +262,13 @@ func (p *Parser) parseIntoSchema(schema *structSchema, rootVal reflect.Value, ar
 		sources[meta] = sourceDefault
 	}
 
-	// 2. Collect and load config sources (for root struct)
+	// 2. Collect and load config sources (for root struct or subcommand)
 	if allowConfigFiles {
-		allSources := make([]configSource, len(p.configSources))
-		copy(allSources, p.configSources)
+		var allSources []configSource
+		if subcmdName == "" {
+			allSources = make([]configSource, len(p.configSources))
+			copy(allSources, p.configSources)
+		}
 
 		if cliRes.configFilePath != "" {
 			allSources = append(allSources, configSource{
@@ -349,7 +344,7 @@ func (p *Parser) parseIntoSchema(schema *structSchema, rootVal reflect.Value, ar
 			}
 			subVal = subVal.Elem()
 		}
-		if err := p.parseIntoSchema(cliRes.subcommand.schema, subVal, cliRes.subcommandArgs, cliRes.subcommand.name, false); err != nil {
+		if err := p.parseIntoSchema(cliRes.subcommand.schema, subVal, cliRes.subcommandArgs, cliRes.subcommand.name, true); err != nil {
 			return err
 		}
 	}

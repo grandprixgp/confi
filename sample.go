@@ -7,6 +7,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"time"
 )
 
 const redactedMask = "********"
@@ -312,6 +313,11 @@ func sampleValueYAML(meta *fieldMeta, rootVal reflect.Value) string {
 		}
 		return meta.defaultValue
 	}
+	if rootVal.IsValid() {
+		if fv, ok := meta.fieldValue(rootVal, false); ok && fv.IsValid() && !isZeroValue(fv) && !meta.secret {
+			return formatRuntimeValueYAML(fv)
+		}
+	}
 	t := meta.fieldType
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
@@ -368,6 +374,11 @@ func sampleValueTOML(meta *fieldMeta, rootVal reflect.Value) string {
 		}
 		return meta.defaultValue
 	}
+	if rootVal.IsValid() {
+		if fv, ok := meta.fieldValue(rootVal, false); ok && fv.IsValid() && !isZeroValue(fv) && !meta.secret {
+			return formatRuntimeValueTOML(fv)
+		}
+	}
 	return sampleValueYAML(meta, rootVal)
 }
 
@@ -389,6 +400,11 @@ func sampleValueObject(meta *fieldMeta, rootVal reflect.Value) interface{} {
 		}
 		return meta.defaultValue
 	}
+	if rootVal.IsValid() {
+		if fv, ok := meta.fieldValue(rootVal, false); ok && fv.IsValid() && !isZeroValue(fv) && !meta.secret {
+			return formatRuntimeValueObject(fv)
+		}
+	}
 	switch t.Kind() {
 	case reflect.Bool:
 		return false
@@ -409,5 +425,174 @@ func sampleValueObject(meta *fieldMeta, rootVal reflect.Value) interface{} {
 		return map[string]interface{}{}
 	default:
 		return ""
+	}
+}
+
+func formatRuntimeValueYAML(fv reflect.Value) string {
+	if fv.Kind() == reflect.Ptr {
+		if fv.IsNil() {
+			return `""`
+		}
+		fv = fv.Elem()
+	}
+	t := fv.Type()
+	if t == durationType {
+		return fmt.Sprintf("%q", fv.Interface().(time.Duration).String())
+	}
+	if t == timeType {
+		return fmt.Sprintf("%q", fv.Interface().(time.Time).Format(time.RFC3339))
+	}
+	if implementsTextUnmarshaler(t) {
+		if s, ok := fv.Interface().(fmt.Stringer); ok {
+			return fmt.Sprintf("%q", s.String())
+		}
+		return fmt.Sprintf("%q", fmt.Sprintf("%v", fv.Interface()))
+	}
+	switch fv.Kind() {
+	case reflect.String:
+		return fmt.Sprintf("%q", fv.String())
+	case reflect.Bool:
+		if fv.Bool() {
+			return "true"
+		}
+		return "false"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return fmt.Sprintf("%d", fv.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return fmt.Sprintf("%d", fv.Uint())
+	case reflect.Float32, reflect.Float64:
+		return fmt.Sprintf("%v", fv.Float())
+	case reflect.Slice:
+		var items []string
+		for i := 0; i < fv.Len(); i++ {
+			elem := fv.Index(i)
+			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+				elem = elem.Elem()
+			}
+			if elem.Type() == durationType {
+				items = append(items, fmt.Sprintf("%q", elem.Interface().(time.Duration).String()))
+			} else if elem.Kind() == reflect.String {
+				items = append(items, fmt.Sprintf("%q", elem.String()))
+			} else {
+				items = append(items, fmt.Sprintf("%v", elem.Interface()))
+			}
+		}
+		return "[" + strings.Join(items, ", ") + "]"
+	case reflect.Map:
+		if fv.Len() == 0 {
+			return "{}"
+		}
+		var parts []string
+		for _, k := range fv.MapKeys() {
+			val := fv.MapIndex(k)
+			parts = append(parts, fmt.Sprintf("%v: %s", k.Interface(), formatRuntimeValueYAML(val)))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		return fmt.Sprintf("%v", fv.Interface())
+	}
+}
+
+func formatRuntimeValueTOML(fv reflect.Value) string {
+	if fv.Kind() == reflect.Ptr {
+		if fv.IsNil() {
+			return `""`
+		}
+		fv = fv.Elem()
+	}
+	t := fv.Type()
+	if t == durationType {
+		return fmt.Sprintf("%q", fv.Interface().(time.Duration).String())
+	}
+	if t == timeType {
+		return fmt.Sprintf("%q", fv.Interface().(time.Time).Format(time.RFC3339))
+	}
+	if implementsTextUnmarshaler(t) {
+		if s, ok := fv.Interface().(fmt.Stringer); ok {
+			return fmt.Sprintf("%q", s.String())
+		}
+		return fmt.Sprintf("%q", fmt.Sprintf("%v", fv.Interface()))
+	}
+	switch fv.Kind() {
+	case reflect.String:
+		return fmt.Sprintf("%q", fv.String())
+	case reflect.Bool:
+		if fv.Bool() {
+			return "true"
+		}
+		return "false"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return fmt.Sprintf("%d", fv.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return fmt.Sprintf("%d", fv.Uint())
+	case reflect.Float32, reflect.Float64:
+		return fmt.Sprintf("%v", fv.Float())
+	case reflect.Slice:
+		var items []string
+		for i := 0; i < fv.Len(); i++ {
+			elem := fv.Index(i)
+			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+				elem = elem.Elem()
+			}
+			if elem.Type() == durationType {
+				items = append(items, fmt.Sprintf("%q", elem.Interface().(time.Duration).String()))
+			} else if elem.Kind() == reflect.String {
+				items = append(items, fmt.Sprintf("%q", elem.String()))
+			} else {
+				items = append(items, fmt.Sprintf("%v", elem.Interface()))
+			}
+		}
+		return "[" + strings.Join(items, ", ") + "]"
+	case reflect.Map:
+		if fv.Len() == 0 {
+			return "{}"
+		}
+		var parts []string
+		for _, k := range fv.MapKeys() {
+			val := fv.MapIndex(k)
+			parts = append(parts, fmt.Sprintf("%v = %s", k.Interface(), formatRuntimeValueTOML(val)))
+		}
+		return "{ " + strings.Join(parts, ", ") + " }"
+	default:
+		return fmt.Sprintf("%v", fv.Interface())
+	}
+}
+
+func formatRuntimeValueObject(fv reflect.Value) interface{} {
+	if fv.Kind() == reflect.Ptr {
+		if fv.IsNil() {
+			return nil
+		}
+		fv = fv.Elem()
+	}
+	t := fv.Type()
+	if t == durationType {
+		return fv.Interface().(time.Duration).String()
+	}
+	if t == timeType {
+		return fv.Interface().(time.Time).Format(time.RFC3339)
+	}
+	if implementsTextUnmarshaler(t) {
+		if s, ok := fv.Interface().(fmt.Stringer); ok {
+			return s.String()
+		}
+		return fmt.Sprintf("%v", fv.Interface())
+	}
+	switch fv.Kind() {
+	case reflect.Slice:
+		var items []interface{}
+		for i := 0; i < fv.Len(); i++ {
+			elem := fv.Index(i)
+			items = append(items, formatRuntimeValueObject(elem))
+		}
+		return items
+	case reflect.Map:
+		out := make(map[string]interface{})
+		for _, k := range fv.MapKeys() {
+			out[fmt.Sprintf("%v", k.Interface())] = formatRuntimeValueObject(fv.MapIndex(k))
+		}
+		return out
+	default:
+		return fv.Interface()
 	}
 }

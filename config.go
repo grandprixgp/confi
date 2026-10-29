@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -111,20 +112,35 @@ func detectFormat(path string, data []byte, hint Format) Format {
 		return FormatJSON
 	}
 
-	// Heuristic: check first non-comment line for [section] (TOML/INI) or KEY=VALUE (.env)
+	hasSection := false
+	hasEquals := false
+	hasYAMLColon := false
+
 	scanner := strings.Split(string(trimmed), "\n")
-	for _, line := range scanner {
-		line = strings.TrimSpace(line)
+	for _, rawLine := range scanner {
+		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			return FormatTOML
+		if (strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]")) || strings.Contains(line, `"""`) || strings.Contains(line, `'''`) {
+			hasSection = true
+			break
 		}
-		if strings.Contains(line, "=") && !strings.Contains(line, ": ") && !strings.HasSuffix(line, ":") {
+		if strings.HasPrefix(strings.ToLower(line), "export ") || strings.HasPrefix(strings.ToLower(line), "export\t") {
 			return FormatEnv
 		}
-		break
+		if strings.Contains(line, ": ") || strings.HasSuffix(line, ":") {
+			hasYAMLColon = true
+		}
+		if strings.Contains(line, "=") {
+			hasEquals = true
+		}
+	}
+	if hasSection {
+		return FormatTOML
+	}
+	if hasEquals && !hasYAMLColon {
+		return FormatEnv
 	}
 	return FormatYAML
 }
@@ -361,19 +377,42 @@ func findKeyInMap(m map[string]interface{}, target string) (interface{}, string,
 		return v, target, true
 	}
 	normTarget := normalizeKey(target)
-	for k, v := range m {
-		if strings.EqualFold(k, target) || normalizeKey(k) == normTarget {
-			return v, k, true
+	var foldMatches []string
+	var normMatches []string
+
+	for k := range m {
+		if strings.EqualFold(k, target) {
+			foldMatches = append(foldMatches, k)
+		} else if normalizeKey(k) == normTarget {
+			normMatches = append(normMatches, k)
 		}
+	}
+	if len(foldMatches) > 0 {
+		sort.Strings(foldMatches)
+		return m[foldMatches[0]], foldMatches[0], true
+	}
+	if len(normMatches) > 0 {
+		sort.Strings(normMatches)
+		return m[normMatches[0]], normMatches[0], true
 	}
 	return nil, "", false
 }
 
 func normalizeKey(s string) string {
-	s = strings.ToLower(s)
-	s = strings.ReplaceAll(s, "-", "")
-	s = strings.ReplaceAll(s, "_", "")
-	return s
+	var buf strings.Builder
+	buf.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '-' || ch == '_' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			buf.WriteByte(ch + ('a' - 'A'))
+		} else {
+			buf.WriteByte(ch)
+		}
+	}
+	return buf.String()
 }
 
 func assignInterfaceValue(fv reflect.Value, val interface{}, sep string) error {
@@ -394,14 +433,11 @@ func assignInterfaceValue(fv reflect.Value, val interface{}, sep string) error {
 		if t.Kind() != reflect.Slice {
 			return fmt.Errorf("cannot assign list to %s", t.String())
 		}
-		elemType := t.Elem()
-		slice := reflect.MakeSlice(t, 0, len(v))
-		for _, item := range v {
-			elemPtr := reflect.New(elemType)
-			if err := assignInterfaceValue(elemPtr.Elem(), item, sep); err != nil {
+		slice := reflect.MakeSlice(t, len(v), len(v))
+		for i, item := range v {
+			if err := assignInterfaceValue(slice.Index(i), item, sep); err != nil {
 				return err
 			}
-			slice = reflect.Append(slice, elemPtr.Elem())
 		}
 		fv.Set(slice)
 		return nil

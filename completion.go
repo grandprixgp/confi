@@ -72,6 +72,9 @@ func (p *Parser) collectFlagTokens(schema *structSchema) []string {
 	if p.configFlag != "" {
 		tokens = append(tokens, p.prefix+p.configFlag)
 	}
+	if p.completionFlag != "" {
+		tokens = append(tokens, p.prefix+p.completionFlag)
+	}
 	if p.helpEnabled {
 		tokens = append(tokens, p.prefix+"help")
 		if p.shortPrefix != "" {
@@ -145,7 +148,7 @@ func (p *Parser) writeBashCompletion(w io.Writer, appName string, safeFunc strin
 	topWords := append(subNames, globalFlags...)
 	fmt.Fprintf(w, "    COMPREPLY=( $(compgen -W %q -- \"$cur\") )\n", strings.Join(topWords, " "))
 	fmt.Fprintf(w, "}\n")
-	fmt.Fprintf(w, "complete -F _%s_completions %s\n", safeFunc, appName)
+	fmt.Fprintf(w, "complete -F _%s_completions %q\n", safeFunc, appName)
 	return nil
 }
 
@@ -210,19 +213,19 @@ func (p *Parser) writeZshCompletion(w io.Writer, appName string, safeFunc string
 	fmt.Fprintf(w, "    )\n")
 	fmt.Fprintf(w, "    _describe '%s' opts\n", appName)
 	fmt.Fprintf(w, "}\n")
-	fmt.Fprintf(w, "compdef _%s %s\n", safeFunc, appName)
+	fmt.Fprintf(w, "compdef _%s %q\n", safeFunc, appName)
 	return nil
 }
 
 func (p *Parser) writeFishCompletion(w io.Writer, appName string, schema *structSchema) error {
 	fmt.Fprintf(w, "# fish completion for %s\n", appName)
 	for _, sub := range schema.subcommandList {
-		fmt.Fprintf(w, "complete -c %s -n '__fish_use_subcommand' -a %q -d %q\n", appName, sub.name, sub.usage)
+		fmt.Fprintf(w, "complete -c %q -n '__fish_use_subcommand' -a %q -d %q\n", appName, sub.name, sub.usage)
 		for _, meta := range sub.schema.fields {
 			if meta.isPositional {
 				continue
 			}
-			line := fmt.Sprintf("complete -c %s -n '__fish_seen_subcommand_from %s' -l %s", appName, sub.name, meta.flagName)
+			line := fmt.Sprintf("complete -c %q -n '__fish_seen_subcommand_from %s' -l %s", appName, sub.name, meta.flagName)
 			if meta.short != "" {
 				line += fmt.Sprintf(" -s %s", meta.short)
 			}
@@ -239,7 +242,7 @@ func (p *Parser) writeFishCompletion(w io.Writer, appName string, schema *struct
 		if meta.isPositional {
 			continue
 		}
-		line := fmt.Sprintf("complete -c %s -l %s", appName, meta.flagName)
+		line := fmt.Sprintf("complete -c %q -l %s", appName, meta.flagName)
 		if meta.short != "" {
 			line += fmt.Sprintf(" -s %s", meta.short)
 		}
@@ -255,19 +258,61 @@ func (p *Parser) writeFishCompletion(w io.Writer, appName string, schema *struct
 }
 
 func (p *Parser) writePowerShellCompletion(w io.Writer, appName string, schema *structSchema) error {
-	tokens := p.collectFlagTokens(schema)
-	for _, sub := range schema.subcommandList {
-		tokens = append(tokens, sub.name)
-		tokens = append(tokens, p.collectFlagTokens(sub.schema)...)
+	globalFlags := p.collectFlagTokens(schema)
+
+	quoteTokens := func(tokens []string) string {
+		var quoted []string
+		for _, t := range tokens {
+			quoted = append(quoted, fmt.Sprintf("'%s'", strings.Replace(t, "'", "''", -1)))
+		}
+		return strings.Join(quoted, ", ")
 	}
-	var quoted []string
-	for _, t := range tokens {
-		quoted = append(quoted, fmt.Sprintf("'%s'", t))
-	}
+
 	fmt.Fprintf(w, "# PowerShell completion for %s\n", appName)
-	fmt.Fprintf(w, "Register-ArgumentCompleter -Native -CommandName '%s' -ScriptBlock {\n", appName)
+	fmt.Fprintf(w, "Register-ArgumentCompleter -Native -CommandName '%s' -ScriptBlock {\n", strings.Replace(appName, "'", "''", -1))
 	fmt.Fprintf(w, "    param($wordToComplete, $commandAst, $cursorPosition)\n")
-	fmt.Fprintf(w, "    $candidates = @(%s)\n", strings.Join(quoted, ", "))
+
+	if len(schema.subcommandList) == 0 {
+		fmt.Fprintf(w, "    $candidates = @(%s)\n", quoteTokens(globalFlags))
+	} else {
+		var subNames []string
+		for _, sub := range schema.subcommandList {
+			subNames = append(subNames, sub.name)
+		}
+
+		fmt.Fprintf(w, "    $subcmd = ''\n")
+		fmt.Fprintf(w, "    if ($commandAst.Elements) {\n")
+		fmt.Fprintf(w, "        $tokens = $commandAst.Elements | ForEach-Object { $_.Extent.Text }\n")
+		fmt.Fprintf(w, "        foreach ($t in $tokens) {\n")
+		fmt.Fprintf(w, "            switch ($t) {\n")
+		for _, sub := range schema.subcommandList {
+			fmt.Fprintf(w, "                '%s' { $subcmd = '%s'; break }\n", sub.name, sub.name)
+			for _, al := range sub.aliases {
+				if al != sub.name {
+					fmt.Fprintf(w, "                '%s' { $subcmd = '%s'; break }\n", al, sub.name)
+				}
+			}
+		}
+		fmt.Fprintf(w, "            }\n")
+		fmt.Fprintf(w, "        }\n")
+		fmt.Fprintf(w, "    }\n")
+
+		fmt.Fprintf(w, "    switch ($subcmd) {\n")
+		for _, sub := range schema.subcommandList {
+			subFlags := append([]string(nil), globalFlags...)
+			subFlags = append(subFlags, p.collectFlagTokens(sub.schema)...)
+			fmt.Fprintf(w, "        '%s' {\n", sub.name)
+			fmt.Fprintf(w, "            $candidates = @(%s)\n", quoteTokens(subFlags))
+			fmt.Fprintf(w, "        }\n")
+		}
+		fmt.Fprintf(w, "        default {\n")
+		rootTokens := append([]string(nil), subNames...)
+		rootTokens = append(rootTokens, globalFlags...)
+		fmt.Fprintf(w, "            $candidates = @(%s)\n", quoteTokens(rootTokens))
+		fmt.Fprintf(w, "        }\n")
+		fmt.Fprintf(w, "    }\n")
+	}
+
 	fmt.Fprintf(w, "    $candidates | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {\n")
 	fmt.Fprintf(w, "        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)\n")
 	fmt.Fprintf(w, "    }\n")

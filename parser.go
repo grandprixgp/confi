@@ -220,7 +220,7 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 		}
 
 		// Check short prefix (default "-")
-		if shortPrefix != "" && strings.HasPrefix(arg, shortPrefix) && len(arg) > len(shortPrefix) && (prefix == "" || !strings.HasPrefix(arg, prefix)) {
+		if shortPrefix != "" && strings.HasPrefix(arg, shortPrefix) && len(arg) > len(shortPrefix) && !strings.HasPrefix(arg[len(shortPrefix):], shortPrefix) && (prefix == "" || !strings.HasPrefix(arg, prefix)) {
 			flushCurrent()
 			withoutShort := arg[len(shortPrefix):]
 
@@ -343,7 +343,7 @@ func (p *Parser) parseCLI(args []string, schema *structSchema) (*cliParseResult,
 			currentFlag.values = append(currentFlag.values, arg)
 			expectingValue = false
 			if currentFlag.meta != nil && !isMultiValueField(currentFlag.meta) {
-				if isStringField(currentFlag.meta) && len(schema.positionalFields) == 0 && len(schema.subcommands) == 0 {
+				if !p.strict && isStringField(currentFlag.meta) && len(schema.positionalFields) == 0 && len(schema.subcommands) == 0 {
 					continue
 				}
 				flushCurrent()

@@ -3,6 +3,7 @@ package confi
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -71,7 +72,7 @@ func validateFieldConstraints(meta *fieldMeta, fv reflect.Value) error {
 	if len(meta.oneOf) > 0 {
 		if fv.Kind() == reflect.Slice && !implementsTextUnmarshaler(fv.Type()) {
 			for i := 0; i < fv.Len(); i++ {
-				elemStr := fmt.Sprintf("%v", fv.Index(i).Interface())
+				elemStr := formatValueForOneOf(fv.Index(i))
 				if !matchesOneOf(elemStr, meta.oneOf) {
 					return &ParseError{
 						Field:   meta.fieldName,
@@ -80,7 +81,7 @@ func validateFieldConstraints(meta *fieldMeta, fv reflect.Value) error {
 				}
 			}
 		} else {
-			valStr := fmt.Sprintf("%v", fv.Interface())
+			valStr := formatValueForOneOf(fv)
 			if !matchesOneOf(valStr, meta.oneOf) {
 				return &ParseError{
 					Field:   meta.fieldName,
@@ -94,26 +95,54 @@ func validateFieldConstraints(meta *fieldMeta, fv reflect.Value) error {
 	if meta.hasMin || meta.hasMax {
 		switch fv.Kind() {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			num := float64(fv.Int())
-			if meta.hasMin && num < meta.minVal {
-				if fv.Type() == durationType {
-					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("duration %v is less than minimum %v", time.Duration(fv.Int()), time.Duration(meta.minVal))}
+			if fv.Type() == durationType {
+				dur := time.Duration(fv.Int())
+				if meta.hasMin && float64(dur) < meta.minVal {
+					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("duration %v is less than minimum %v", dur, time.Duration(meta.minVal))}
 				}
-				return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v is less than minimum %v", fv.Int(), meta.minVal)}
-			}
-			if meta.hasMax && num > meta.maxVal {
-				if fv.Type() == durationType {
-					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("duration %v exceeds maximum %v", time.Duration(fv.Int()), time.Duration(meta.maxVal))}
+				if meta.hasMax && float64(dur) > meta.maxVal {
+					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("duration %v exceeds maximum %v", dur, time.Duration(meta.maxVal))}
 				}
-				return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v exceeds maximum %v", fv.Int(), meta.maxVal)}
+			} else {
+				val := fv.Int()
+				if meta.hasMin {
+					minI, err := strconv.ParseInt(meta.minStr, 10, 64)
+					if err != nil {
+						minI = int64(meta.minVal)
+					}
+					if val < minI {
+						return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v is less than minimum %v", val, minI)}
+					}
+				}
+				if meta.hasMax {
+					maxI, err := strconv.ParseInt(meta.maxStr, 10, 64)
+					if err != nil {
+						maxI = int64(meta.maxVal)
+					}
+					if val > maxI {
+						return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v exceeds maximum %v", val, maxI)}
+					}
+				}
 			}
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			num := float64(fv.Uint())
-			if meta.hasMin && num < meta.minVal {
-				return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v is less than minimum %v", fv.Uint(), meta.minVal)}
+			val := fv.Uint()
+			if meta.hasMin {
+				minU, err := strconv.ParseUint(meta.minStr, 10, 64)
+				if err != nil {
+					minU = uint64(meta.minVal)
+				}
+				if val < minU {
+					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v is less than minimum %v", val, minU)}
+				}
 			}
-			if meta.hasMax && num > meta.maxVal {
-				return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v exceeds maximum %v", fv.Uint(), meta.maxVal)}
+			if meta.hasMax {
+				maxU, err := strconv.ParseUint(meta.maxStr, 10, 64)
+				if err != nil {
+					maxU = uint64(meta.maxVal)
+				}
+				if val > maxU {
+					return &ParseError{Field: meta.fieldName, Message: fmt.Sprintf("value %v exceeds maximum %v", val, maxU)}
+				}
 			}
 		case reflect.Float32, reflect.Float64:
 			num := fv.Float()
@@ -177,6 +206,40 @@ func matchesOneOf(val string, choices []string) bool {
 	return false
 }
 
+func formatValueForOneOf(v reflect.Value) string {
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.String:
+		return v.String()
+	case reflect.Bool:
+		if v.Bool() {
+			return "true"
+		}
+		return "false"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if v.Type() == durationType {
+			return time.Duration(v.Int()).String()
+		}
+		return strconv.FormatInt(v.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.FormatUint(v.Uint(), 10)
+	case reflect.Float32:
+		return strconv.FormatFloat(v.Float(), 'g', -1, 32)
+	case reflect.Float64:
+		return strconv.FormatFloat(v.Float(), 'g', -1, 64)
+	default:
+		if v.CanInterface() {
+			return fmt.Sprintf("%v", v.Interface())
+		}
+		return ""
+	}
+}
+
 func invokeCustomValidators(v reflect.Value) error {
 	visited := make(map[uintptr]bool)
 	return invokeCustomValidatorsHelper(v, visited)
@@ -185,6 +248,12 @@ func invokeCustomValidators(v reflect.Value) error {
 func invokeCustomValidatorsHelper(v reflect.Value, visited map[uintptr]bool) error {
 	if !v.IsValid() {
 		return nil
+	}
+	if v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
 	}
 	if v.Kind() == reflect.Ptr {
 		if v.IsNil() {
@@ -198,8 +267,9 @@ func invokeCustomValidatorsHelper(v reflect.Value, visited map[uintptr]bool) err
 		v = v.Elem()
 	}
 
-	// Recurse into struct fields first so leaf/nested structs validate before parent
-	if v.Kind() == reflect.Struct {
+	// Recurse into child elements first so leaf/nested elements validate before parent
+	switch v.Kind() {
+	case reflect.Struct:
 		t := v.Type()
 		for i := 0; i < v.NumField(); i++ {
 			sf := t.Field(i)
@@ -211,6 +281,18 @@ func invokeCustomValidatorsHelper(v reflect.Value, visited map[uintptr]bool) err
 				return err
 			}
 		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if err := invokeCustomValidatorsHelper(v.Index(i), visited); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		for _, key := range v.MapKeys() {
+			if err := invokeCustomValidatorsHelper(v.MapIndex(key), visited); err != nil {
+				return err
+			}
+		}
 	}
 
 	if v.CanAddr() && v.Addr().Type().Implements(validatorType) {
@@ -219,6 +301,12 @@ func invokeCustomValidatorsHelper(v reflect.Value, visited map[uintptr]bool) err
 		}
 	} else if v.Type().Implements(validatorType) {
 		if err := v.Interface().(Validator).Validate(); err != nil {
+			return err
+		}
+	} else if reflect.PtrTo(v.Type()).Implements(validatorType) {
+		vp := reflect.New(v.Type())
+		vp.Elem().Set(v)
+		if err := vp.Interface().(Validator).Validate(); err != nil {
 			return err
 		}
 	}

@@ -39,8 +39,20 @@ func Watch(target interface{}, onChange func(error), opts ...Option) (*Watcher, 
 // Watch parses target initially and starts a background goroutine that polls configured files
 // for modifications using this Parser's settings.
 func (p *Parser) Watch(target interface{}, onChange func(error)) (*Watcher, error) {
+	if _, _, err := extractSchema(target); err != nil {
+		return nil, err
+	}
+
+	elemVal := reflect.ValueOf(target).Elem()
+	initialCopy := deepCopyValue(elemVal)
+
 	if err := p.Parse(target); err != nil {
 		return nil, err
+	}
+
+	paths := p.collectWatchedFiles(target)
+	if len(paths) == 0 {
+		return nil, &ParseError{Message: "no configuration files found to watch"}
 	}
 
 	interval := p.watchInterval
@@ -48,21 +60,16 @@ func (p *Parser) Watch(target interface{}, onChange func(error)) (*Watcher, erro
 		interval = 500 * time.Millisecond
 	}
 
-	elemVal := reflect.ValueOf(target).Elem()
-	initialCopy := reflect.New(elemVal.Type())
-	initialCopy.Elem().Set(elemVal)
-
 	w := &Watcher{
 		parser:   p,
 		target:   target,
-		initial:  initialCopy.Elem(),
+		initial:  initialCopy,
 		onChange: onChange,
 		interval: interval,
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
 
-	paths := p.collectWatchedFiles(target)
 	snapshots := takeSnapshots(paths, nil)
 
 	go w.loop(paths, snapshots)
@@ -117,7 +124,7 @@ func (w *Watcher) loop(paths []string, snapshots map[string]fileSnapshot) {
 
 			elemType := reflect.ValueOf(w.target).Elem().Type()
 			freshPtr := reflect.New(elemType)
-			freshPtr.Elem().Set(w.initial)
+			freshPtr.Elem().Set(deepCopyValue(w.initial))
 			err := w.parser.Parse(freshPtr.Interface())
 			if err == nil {
 				w.mu.Lock()
@@ -191,6 +198,48 @@ func takeSnapshots(paths []string, prev map[string]fileSnapshot) map[string]file
 		}
 	}
 	return snaps
+}
+
+func deepCopyValue(v reflect.Value) reflect.Value {
+	if !v.IsValid() {
+		return v
+	}
+	t := v.Type()
+	cp := reflect.New(t).Elem()
+	cp.Set(v)
+
+	switch t.Kind() {
+	case reflect.Ptr:
+		if !v.IsNil() {
+			elemCopy := deepCopyValue(v.Elem())
+			newPtr := reflect.New(t.Elem())
+			newPtr.Elem().Set(elemCopy)
+			cp.Set(newPtr)
+		}
+	case reflect.Slice:
+		if !v.IsNil() {
+			newSlice := reflect.MakeSlice(t, v.Len(), v.Cap())
+			for i := 0; i < v.Len(); i++ {
+				newSlice.Index(i).Set(deepCopyValue(v.Index(i)))
+			}
+			cp.Set(newSlice)
+		}
+	case reflect.Map:
+		if !v.IsNil() {
+			newMap := reflect.MakeMapWithSize(t, v.Len())
+			for _, k := range v.MapKeys() {
+				newMap.SetMapIndex(deepCopyValue(k), deepCopyValue(v.MapIndex(k)))
+			}
+			cp.Set(newMap)
+		}
+	case reflect.Struct:
+		for i := 0; i < t.NumField(); i++ {
+			if cp.Field(i).CanSet() {
+				cp.Field(i).Set(deepCopyValue(v.Field(i)))
+			}
+		}
+	}
+	return cp
 }
 
 func snapshotsChanged(prev, next map[string]fileSnapshot) bool {

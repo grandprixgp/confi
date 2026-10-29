@@ -20,7 +20,8 @@ func parseDotEnv(r io.Reader, lookupEnv func(string) (string, bool)) (map[string
 			continue
 		}
 
-		if strings.HasPrefix(line, "export ") || strings.HasPrefix(line, "export\t") {
+		lowerLine := strings.ToLower(line)
+		if strings.HasPrefix(lowerLine, "export ") || strings.HasPrefix(lowerLine, "export\t") {
 			line = strings.TrimSpace(line[len("export"):])
 		}
 
@@ -103,7 +104,12 @@ func parseDotEnvValue(raw string, current map[string]string, lookupEnv func(stri
 		if endIdx < 0 {
 			return "", fmt.Errorf("unterminated single-quoted string %s", raw)
 		}
-		return raw[1 : 1+endIdx], nil
+		closeIdx := 1 + endIdx
+		suffix := strings.TrimSpace(raw[closeIdx+1:])
+		if suffix != "" && !strings.HasPrefix(suffix, "#") {
+			return "", fmt.Errorf("unexpected trailing characters after quote: %q", suffix)
+		}
+		return raw[1:closeIdx], nil
 	}
 
 	// Double-quoted value: process escapes and variable interpolation
@@ -111,6 +117,7 @@ func parseDotEnvValue(raw string, current map[string]string, lookupEnv func(stri
 		var buf strings.Builder
 		escaped := false
 		closed := false
+		closeIdx := -1
 		for i := 1; i < len(raw); i++ {
 			ch := raw[i]
 			if escaped {
@@ -124,7 +131,12 @@ func parseDotEnvValue(raw string, current map[string]string, lookupEnv func(stri
 				case '"':
 					buf.WriteByte('"')
 				case '\\':
-					buf.WriteByte('\\')
+					if i+1 < len(raw) && raw[i+1] == '$' {
+						buf.WriteString("\\\\$")
+						i++
+					} else {
+						buf.WriteByte('\\')
+					}
 				case '$':
 					buf.WriteString("\\$")
 				default:
@@ -139,12 +151,17 @@ func parseDotEnvValue(raw string, current map[string]string, lookupEnv func(stri
 			}
 			if ch == '"' {
 				closed = true
+				closeIdx = i
 				break
 			}
 			buf.WriteByte(ch)
 		}
 		if !closed {
 			return "", fmt.Errorf("unterminated double-quoted string %s", raw)
+		}
+		suffix := strings.TrimSpace(raw[closeIdx+1:])
+		if suffix != "" && !strings.HasPrefix(suffix, "#") {
+			return "", fmt.Errorf("unexpected trailing characters after quote: %q", suffix)
 		}
 		return expandEnvVars(buf.String(), current, lookupEnv), nil
 	}

@@ -70,8 +70,10 @@ type fieldMeta struct {
 	oneOf           []string
 	hasMin          bool
 	minVal          float64
+	minStr          string
 	hasMax          bool
 	maxVal          float64
+	maxStr          string
 	pattern         string
 	compiledPattern *regexp.Regexp
 }
@@ -272,9 +274,13 @@ func walkStructType(t reflect.Type, indexPrefix []int, namePrefix []string, envP
 
 		for _, alias := range meta.aliases {
 			lower := strings.ToLower(alias)
-			if _, exists := schema.byFlag[lower]; !exists {
-				schema.byFlag[lower] = meta
+			if existing, exists := schema.byFlag[lower]; exists && existing != meta {
+				return &ParseError{
+					Field:   meta.fieldName,
+					Message: fmt.Sprintf("duplicate flag %q on fields %s and %s", alias, existing.fieldName, meta.fieldName),
+				}
 			}
+			schema.byFlag[lower] = meta
 		}
 
 		if meta.short != "" {
@@ -389,6 +395,9 @@ func parseConfiTag(tag string) tagOptions {
 			opts.squash = true
 		case "config", "config_file", "is_config":
 			opts.isConfig = true
+			if idx == 0 && opts.name == "" && lower == "config" {
+				opts.name = part
+			}
 		case "positional", "pos":
 			opts.isPositional = true
 		case "subcommand", "cmd":
@@ -404,19 +413,32 @@ func parseConfiTag(tag string) tagOptions {
 	return opts
 }
 
-// splitTagParts splits a comma-separated tag string while respecting single-quoted substrings.
+// splitTagParts splits a comma-separated tag string while respecting single- and double-quoted substrings.
 func splitTagParts(s string) []string {
 	var parts []string
 	var buf strings.Builder
-	inQuote := false
+	var activeQuote byte
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
-		if ch == '\'' {
-			inQuote = !inQuote
+		if ch == '\\' && i+1 < len(s) && (s[i+1] == '\'' || s[i+1] == '"' || s[i+1] == '\\') {
+			buf.WriteByte(ch)
+			buf.WriteByte(s[i+1])
+			i++
+			continue
+		}
+		if activeQuote != 0 {
+			if ch == activeQuote {
+				activeQuote = 0
+			}
 			buf.WriteByte(ch)
 			continue
 		}
-		if ch == ',' && !inQuote {
+		if ch == '\'' || ch == '"' {
+			activeQuote = ch
+			buf.WriteByte(ch)
+			continue
+		}
+		if ch == ',' {
 			parts = append(parts, buf.String())
 			buf.Reset()
 			continue
@@ -429,7 +451,14 @@ func splitTagParts(s string) []string {
 
 func unquoteTagVal(s string) string {
 	if len(s) >= 2 && ((s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"')) {
-		return s[1 : len(s)-1]
+		quote := s[0]
+		inner := s[1 : len(s)-1]
+		if quote == '"' && strings.Contains(inner, `\"`) {
+			inner = strings.ReplaceAll(inner, `\"`, `"`)
+		} else if quote == '\'' && strings.Contains(inner, `\'`) {
+			inner = strings.ReplaceAll(inner, `\'`, `'`)
+		}
+		return inner
 	}
 	return s
 }
@@ -588,6 +617,11 @@ func buildFieldMeta(sf reflect.StructField, indexPath []int, namePrefix []string
 		}
 	}
 
+	derefFieldType := sf.Type
+	if derefFieldType.Kind() == reflect.Ptr {
+		derefFieldType = derefFieldType.Elem()
+	}
+
 	minStr := opts.minStr
 	if minStr == "" {
 		minStr = strings.TrimSpace(sf.Tag.Get("min"))
@@ -597,7 +631,7 @@ func buildFieldMeta(sf reflect.StructField, indexPath []int, namePrefix []string
 	if minStr != "" {
 		var v float64
 		var err error
-		if sf.Type == durationType {
+		if derefFieldType == durationType {
 			var d time.Duration
 			d, err = time.ParseDuration(minStr)
 			v = float64(d)
@@ -620,7 +654,7 @@ func buildFieldMeta(sf reflect.StructField, indexPath []int, namePrefix []string
 	if maxStr != "" {
 		var v float64
 		var err error
-		if sf.Type == durationType {
+		if derefFieldType == durationType {
 			var d time.Duration
 			d, err = time.ParseDuration(maxStr)
 			v = float64(d)
@@ -671,8 +705,10 @@ func buildFieldMeta(sf reflect.StructField, indexPath []int, namePrefix []string
 		oneOf:           oneOf,
 		hasMin:          hasMin,
 		minVal:          minVal,
+		minStr:          minStr,
 		hasMax:          hasMax,
 		maxVal:          maxVal,
+		maxStr:          maxStr,
 		pattern:         pattern,
 		compiledPattern: compiledPattern,
 	}, nil
